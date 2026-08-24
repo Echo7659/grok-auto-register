@@ -27,6 +27,8 @@ from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 
+import cf_turnstile
+
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
@@ -71,6 +73,12 @@ DEFAULT_CONFIG = {
     "cpa_mint_browser_recycle_every": 15,
     "cpa_hotload_dir": "",
     "cpa_copy_to_hotload": False,
+    "cpa_management_auto_upload": False,
+    "cpa_management_base": "",
+    "cpa_management_key": "",
+    "cpa_management_timeout_sec": 15,
+    "cpa_management_use_system_proxy": False,
+    "cpa_management_upload_required": False,
     "cpa_server_host": "",
     "cpa_server_user": "root",
     "cpa_server_password": "",
@@ -83,6 +91,10 @@ DEFAULT_CONFIG = {
     "browser_use_custom_ua": False,
     "log_level": "info",
     "speed_log_interval_sec": 60,
+    "cf_auto_click": True,
+    "keep_cf_cookies": True,
+    "cf_os_click": True,
+    "cf_turnstile_timeout_sec": 45,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -732,6 +744,77 @@ def create_browser_options():
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
+
+
+def _cf_timeout_sec(default=45):
+    try:
+        return max(8.0, float(config.get("cf_turnstile_timeout_sec", default) or default))
+    except Exception:
+        return float(default)
+
+
+def snapshot_cf_cookies(log_callback=None):
+    if not config.get("keep_cf_cookies", True):
+        return list(getattr(_tls, "cf_cookies", None) or [])
+    cookies = cf_turnstile.collect_cf_cookies(_get_page(), _get_browser())
+    if cookies:
+        _tls.cf_cookies = cookies
+        if log_callback:
+            names = ", ".join(sorted({c.get("name", "") for c in cookies if c.get("name")}))
+            log_callback(f"[Debug] 已缓存 Cloudflare cookie: {names or len(cookies)}")
+        return cookies
+    return list(getattr(_tls, "cf_cookies", None) or [])
+
+
+def restore_cf_cookies(log_callback=None):
+    if not config.get("keep_cf_cookies", True):
+        return 0
+    cookies = list(getattr(_tls, "cf_cookies", None) or [])
+    if not cookies:
+        return 0
+    return cf_turnstile.inject_cookies(_get_page(), cookies, log=log_callback)
+
+
+def _should_use_os_click(log_callback=None):
+    """系统鼠标全局唯一；多开时禁用，避免点到别的浏览器窗口。"""
+    if not bool(config.get("cf_os_click", True)):
+        return False
+    try:
+        concurrent = max(1, int(config.get("concurrent_count", 1) or 1))
+    except Exception:
+        concurrent = 1
+    if concurrent > 1:
+        # 每个 worker 只提示一次，避免刷屏
+        if not getattr(_tls, "_os_click_disabled_logged", False):
+            _tls._os_click_disabled_logged = True
+            if log_callback:
+                log_callback(
+                    f"[*] concurrent_count={concurrent}，已禁用系统鼠标点击，改用各浏览器独立 CDP 点击"
+                )
+        return False
+    return True
+
+
+def try_solve_turnstile(log_callback=None, cancel_callback=None, timeout=None, require=False):
+    raise_if_cancelled(cancel_callback)
+    page = _get_page()
+    if page is None:
+        return ""
+    try:
+        token = cf_turnstile.solve_turnstile(
+            page,
+            timeout=_cf_timeout_sec() if timeout is None else timeout,
+            log=log_callback,
+            cancel_callback=cancel_callback,
+            auto_click=bool(config.get("cf_auto_click", True)),
+            os_click=_should_use_os_click(log_callback=log_callback),
+            require=require,
+        )
+    except cf_turnstile.TurnstileStopped:
+        raise RegistrationCancelled()
+    if token:
+        snapshot_cf_cookies(log_callback=log_callback)
+    return token
 
 
 def _build_request_kwargs(**kwargs):
@@ -1751,6 +1834,9 @@ def start_browser(log_callback=None):
             _set_page(tabs[-1] if tabs else _get_browser().new_tab())
             if log_callback and getattr(_get_browser(), "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {_get_browser().user_data_path}")
+            if log_callback and os.path.exists(EXTENSION_PATH):
+                log_callback("[Debug] 已加载 turnstilePatch 扩展")
+            restore_cf_cookies(log_callback=log_callback)
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return _get_browser(), _get_page()
@@ -1770,6 +1856,7 @@ def start_browser(log_callback=None):
 
 
 def stop_browser():
+    snapshot_cf_cookies()
     profile_path = None
     browser = _get_browser()
     if browser is not None:
@@ -1803,7 +1890,7 @@ def restart_browser(log_callback=None):
 
 
 def prepare_clean_browser_session(log_callback=None, cancel_callback=None):
-    """轻量清理：避免预访问 xAI/grok 触发 Cloudflare，同时尽量清掉残留登录态。"""
+    """轻量清理：清登录态，可选保留 Cloudflare cookie，且不预访问注册站。"""
     raise_if_cancelled(cancel_callback)
     page = _get_page()
     browser = _get_browser()
@@ -1826,18 +1913,18 @@ try { sessionStorage.clear(); } catch (e) {}
                 )
             except Exception:
                 pass
-        # 尽量清 cookie，但不主动打开 accounts.x.ai / grok.com（容易先撞 CF）
-        if browser is not None and hasattr(browser, "set_cookies"):
-            try:
-                browser.set_cookies(False)
-            except Exception:
-                pass
-        if page is not None and hasattr(page, "set_cookies"):
-            try:
-                page.set_cookies(False)
-            except Exception:
-                pass
-        if log_callback:
+        keep_cf = bool(config.get("keep_cf_cookies", True))
+        cf_cookies = cf_turnstile.collect_cf_cookies(page, browser) if keep_cf else []
+        if cf_cookies:
+            _tls.cf_cookies = cf_cookies
+        elif keep_cf:
+            cf_cookies = list(getattr(_tls, "cf_cookies", None) or [])
+        cf_turnstile.clear_browser_cookies(page, browser)
+        if keep_cf and cf_cookies:
+            cf_turnstile.inject_cookies(page, cf_cookies, log=log_callback)
+            if log_callback:
+                log_callback(f"[Debug] 已清理登录态并保留 {len(cf_cookies)} 个 Cloudflare cookie")
+        elif log_callback:
             log_callback("[Debug] 已做轻量会话清理，准备打开注册页")
     except Exception as exc:
         if log_callback:
@@ -1845,54 +1932,25 @@ try { sessionStorage.clear(); } catch (e) {}
         restart_browser(log_callback=log_callback)
 
 
-def detect_cloudflare_block_page(log_callback=None):
-    """检测当前页是否为 Cloudflare 拦截/故障排除页。"""
+def inspect_current_cloudflare(log_callback=None):
+    """Return (kind, detail) where kind is hard-block, challenge, or none."""
     page = _get_page()
     if page is None:
-        return False, ""
+        return "none", ""
     try:
-        info = page.run_js(
-            r"""
-const body = ((document.body && (document.body.innerText || document.body.textContent)) || '')
-  .replace(/\s+/g, ' ').trim().slice(0, 500);
-const title = document.title || '';
-const html = (document.documentElement && document.documentElement.innerHTML || '').slice(0, 2000);
-return { url: location.href || '', title, body, html };
-"""
-        )
+        return cf_turnstile.inspect_cloudflare_page(page, log=log_callback)
     except Exception as exc:
         if log_callback:
             log_callback(f"[Debug] 读取页面检测 CF 失败: {exc}")
-        return False, ""
-    if not isinstance(info, dict):
-        return False, ""
-    blob = " ".join(
-        [
-            str(info.get("url") or ""),
-            str(info.get("title") or ""),
-            str(info.get("body") or ""),
-            str(info.get("html") or ""),
-        ]
-    ).lower()
-    markers = (
-        "故障排除",
-        "attention required",
-        "cf-error",
-        "cf-error-details",
-        "sorry, you have been blocked",
-        "you have been blocked",
-        "checking your browser before accessing",
-        "enable javascript and cookies",
-        "cloudflare ray id",
-        "error code 1020",
-        "error code 1005",
-        "access denied",
-    )
-    hit = next((m for m in markers if m in blob), "")
-    if not hit:
-        return False, ""
-    detail = f"url={info.get('url') or ''}; marker={hit}; title={info.get('title') or ''}"
-    return True, detail
+        return "none", ""
+
+
+def detect_cloudflare_block_page(log_callback=None):
+    """检测当前页是否为 Cloudflare 硬拦截/故障排除页（不含可点击的人机验证）。"""
+    kind, detail = inspect_current_cloudflare(log_callback=log_callback)
+    if kind == "hard-block":
+        return True, detail
+    return False, ""
 
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
@@ -2074,9 +2132,18 @@ def click_email_signup_button(timeout=18, log_callback=None, cancel_callback=Non
     last_diag = 0.0
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
-        blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
-        if blocked:
+        kind, detail = inspect_current_cloudflare()
+        if kind == "hard-block":
             raise Exception(f"Cloudflare 拦截页，无法点击邮箱注册: {detail}")
+        if kind == "challenge":
+            if log_callback:
+                log_callback("[*] 注册入口遇到人机验证，尝试自动点击")
+            remain = max(3.0, deadline - time.time())
+            try_solve_turnstile(
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                timeout=min(_cf_timeout_sec(), remain),
+            )
         if log_callback:
             log_callback("[Debug] 尝试查找“使用邮箱注册”按钮...")
 
@@ -2122,8 +2189,8 @@ def click_email_signup_button(timeout=18, log_callback=None, cancel_callback=Non
             pass
         sleep_with_cancel(0.8, cancel_callback)
 
-    blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
-    if blocked:
+    kind, detail = inspect_current_cloudflare(log_callback=log_callback)
+    if kind == "hard-block":
         raise Exception(f"Cloudflare 拦截页，无法点击邮箱注册: {detail}")
     snap = _signup_page_snapshot(log_callback)
     if log_callback:
@@ -2172,8 +2239,22 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             _get_page().wait.doc_loaded()
             # 给 CF/前端一点渲染时间
             sleep_with_cancel(1.2, cancel_callback)
-            blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
-            if blocked:
+            kind, detail = inspect_current_cloudflare(log_callback=log_callback)
+            if kind == "challenge":
+                if log_callback:
+                    log_callback("[*] 打开注册页后出现人机验证，尝试自动处理")
+                token = try_solve_turnstile(
+                    log_callback=log_callback, cancel_callback=cancel_callback
+                )
+                kind, detail = inspect_current_cloudflare(log_callback=log_callback)
+                if kind == "challenge" and not token:
+                    last_exc = Exception(f"Cloudflare 人机验证未通过: {detail}")
+                    if log_callback:
+                        log_callback(f"[!] 人机验证未自动通过，重启浏览器重试 ({attempt}/3): {detail}")
+                    restart_browser(log_callback=log_callback)
+                    sleep_with_cancel(1.5, cancel_callback)
+                    continue
+            if kind == "hard-block":
                 last_exc = Exception(f"Cloudflare 拦截页: {detail}")
                 if log_callback:
                     log_callback(f"[!] 检测到 Cloudflare 拦截/故障排除页，重启浏览器重试 ({attempt}/3): {detail}")
@@ -2201,8 +2282,11 @@ def open_signup_page(log_callback=None, cancel_callback=None):
     _deadline = time.time() + 10
     while time.time() < _deadline:
         raise_if_cancelled(cancel_callback)
-        blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
-        if blocked:
+        kind, detail = inspect_current_cloudflare(log_callback=log_callback)
+        if kind == "challenge":
+            try_solve_turnstile(log_callback=log_callback, cancel_callback=cancel_callback)
+            kind, detail = inspect_current_cloudflare(log_callback=log_callback)
+        if kind == "hard-block":
             if log_callback:
                 log_callback(f"[!] 注册页加载后仍是 Cloudflare 拦截页: {detail}")
             raise Exception(f"Cloudflare 拦截页: {detail}")
@@ -2249,9 +2333,16 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     deadline = time.time() + timeout
     last_diag_time = 0
     last_reclick_time = 0
+    last_cf_time = 0
     last_snapshot = None
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        now = time.time()
+        if now - last_cf_time >= 3:
+            kind, _detail = inspect_current_cloudflare()
+            if kind == "challenge":
+                try_solve_turnstile(log_callback=log_callback, cancel_callback=cancel_callback)
+            last_cf_time = now
         filled = _get_page().run_js(
             """
 const email = arguments[0];
@@ -2621,80 +2712,37 @@ return 'clicked';
 def getTurnstileToken(log_callback=None, cancel_callback=None):
     if _get_page() is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
+    token = try_solve_turnstile(
+        log_callback=log_callback, cancel_callback=cancel_callback, require=True
+    )
+    if cf_turnstile.is_turnstile_token_ready(token):
+        return token
+    # 不抛错：外层等待循环可继续，方便手动点完后自动接着走
+    if log_callback:
+        log_callback("[!] Turnstile 本轮未拿到 token，继续等待/重试自动点击")
+    return ""
 
-    try:
-        _get_page().run_js(
-            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
-        )
-    except Exception:
-        pass
 
-    for _ in range(0, 20):
-        raise_if_cancelled(cancel_callback)
-        try:
-            token = _get_page().run_js(
-                """
-try {
-  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
-  if (byInput) return byInput;
-  if (window.turnstile && typeof turnstile.getResponse === 'function') {
-    return String(turnstile.getResponse() || '').trim();
-  }
-  return '';
-} catch(e) { return ''; }
-                """
-            )
-            token = str(token or "").strip()
-            if len(token) >= 80:
-                if log_callback:
-                    log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
-                return token
-
-            challenge_input = _get_page().ele("@name=cf-turnstile-response")
-            if challenge_input:
-                wrapper = challenge_input.parent()
-                iframe = None
-                try:
-                    iframe = wrapper.shadow_root.ele("tag:iframe")
-                except Exception:
-                    iframe = None
-                if iframe:
-                    try:
-                        iframe.run_js(
-                            """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-                            """
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn:
-                            btn.click()
-                    except Exception:
-                        pass
-            else:
-                # 兜底：尝试触发页面上可见的 Turnstile 容器
-                _get_page().run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
-                )
-        except Exception:
-            pass
-        sleep_with_cancel(1, cancel_callback)
-
-    raise Exception("Turnstile 获取 token 失败")
+def _sync_turnstile_token(token, log_callback=None):
+    if not token or token == "passed" or _get_page() is None:
+        return None
+    synced = _get_page().run_js(
+        """
+const token = String(arguments[0] || '').trim();
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return false;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token);
+else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+return String(cfInput.value || '').trim().length;
+        """,
+        token,
+    )
+    if log_callback:
+        log_callback(f"[*] Turnstile 处理完成，回填长度={synced}")
+    return synced
 
 
 def build_profile():
@@ -2728,6 +2776,22 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
+
+    # 资料页一进来就先快速点一次，不要等填完表单才开始处理
+    try:
+        early = try_solve_turnstile(
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            timeout=8,
+            require=False,
+        )
+        if early:
+            last_cf_retry_at = time.time()
+    except RegistrationCancelled:
+        raise
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 资料页预点击 Turnstile 跳过: {exc}")
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2813,42 +2877,24 @@ return 'filled-no-submit';
                 token_len = filled.split(":", 1)[1] if ":" in filled else "0"
                 if log_callback:
                     log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
-                if token_len == "0":
-                    pause_seconds = random.uniform(1, 3)
-                    if log_callback:
-                        log_callback(f"[*] Cloudflare token 为空，暂停 {pause_seconds:.1f}s 后继续检测")
-                    sleep_with_cancel(pause_seconds, cancel_callback)
                 now = time.time()
                 if wait_cf_since is None:
                     wait_cf_since = now
-                # 卡住后自动二次复用 Turnstile 组件
-                if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                    if log_callback:
-                        log_callback("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
+                if now - last_cf_retry_at >= 0.4:
                     try:
-                        token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
+                        token = try_solve_turnstile(
+                            log_callback=log_callback,
+                            cancel_callback=cancel_callback,
+                            timeout=min(12.0, max(3.0, deadline - time.time())),
+                            require=True,
+                        )
                         if token:
-                            synced = _get_page().run_js(
-                                """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                """,
-                                token,
-                            )
-                            if log_callback:
-                                log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
+                            _sync_turnstile_token(token, log_callback=log_callback)
                     except Exception as cf_exc:
                         if log_callback:
-                            log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
+                            log_callback(f"[Debug] Turnstile 自动处理异常: {cf_exc}")
                     last_cf_retry_at = now
-                sleep_with_cancel(0.8, cancel_callback)
+                sleep_with_cancel(0.35, cancel_callback)
                 continue
 
             if filled in ("ready-to-submit", "filled-no-submit"):
@@ -2913,33 +2959,21 @@ return 'submitted';
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now
-            if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                if log_callback:
-                    log_callback("[*] 提交前仍卡住，自动再次复用 Turnstile...")
+            if now - last_cf_retry_at >= 0.4:
                 try:
-                    token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
+                    token = try_solve_turnstile(
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                        timeout=min(12.0, max(3.0, deadline - time.time())),
+                        require=True,
+                    )
                     if token:
-                        synced = _get_page().run_js(
-                            """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                            """,
-                            token,
-                        )
-                        if log_callback:
-                            log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
+                        _sync_turnstile_token(token, log_callback=log_callback)
                 except Exception as cf_exc:
                     if log_callback:
-                        log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
+                        log_callback(f"[Debug] Turnstile 自动处理异常: {cf_exc}")
                 last_cf_retry_at = now
-            sleep_with_cancel(0.8, cancel_callback)
+            sleep_with_cancel(0.35, cancel_callback)
             continue
 
         if submit_state == "submitted":
@@ -3044,31 +3078,21 @@ return 'final-page-clicked-submit';
                 if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
                     token_len = retried.split(":", 1)[1] if ":" in retried else "0"
                     log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}")
-                    if now - last_cf_retry_at >= 10:
+                    if now - last_cf_retry_at >= 0.4:
                         if log_callback:
-                            log_callback("[*] 最终页 Cloudflare 卡住，自动二次复用 Turnstile...")
+                            log_callback("[*] 最终页 Cloudflare 未通过，自动点击人机验证...")
                         try:
-                            token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
+                            token = try_solve_turnstile(
+                                log_callback=log_callback,
+                                cancel_callback=cancel_callback,
+                                timeout=min(12.0, max(3.0, deadline - time.time())),
+                                require=True,
+                            )
                             if token:
-                                synced = _get_page().run_js(
-                                    """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                    """,
-                                    token,
-                                )
-                                if log_callback:
-                                    log_callback(f"[*] 最终页 Turnstile 二次复用完成，回填长度={synced}")
+                                _sync_turnstile_token(token, log_callback=log_callback)
                         except Exception as cf_exc:
                             if log_callback:
-                                log_callback(f"[Debug] 最终页 Turnstile 二次复用失败: {cf_exc}")
+                                log_callback(f"[Debug] 最终页 Turnstile 自动处理异常: {cf_exc}")
                         last_cf_retry_at = now
 
             cookies = _get_page().cookies(all_domains=True, all_info=True) or []
@@ -3182,8 +3206,16 @@ class GrokRegisterGUI:
 
         add_label(1, 0, "注册选项:")
         self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
-        self.nsfw_check = tk_checkbutton(config_frame, text="注册后开启 NSFW", variable=self.nsfw_var)
-        add_field(self.nsfw_check, 1, 1, sticky=tk.W)
+        self.cf_auto_click_var = tk.BooleanVar(value=bool(config.get("cf_auto_click", True)))
+        self.keep_cf_cookies_var = tk.BooleanVar(value=bool(config.get("keep_cf_cookies", True)))
+        opt_box = tk.Frame(config_frame, bg=UI_PANEL_BG)
+        self.nsfw_check = tk_checkbutton(opt_box, text="注册后开启 NSFW", variable=self.nsfw_var)
+        self.nsfw_check.pack(side=tk.LEFT)
+        self.cf_auto_click_check = tk_checkbutton(opt_box, text="自动点击人机验证", variable=self.cf_auto_click_var)
+        self.cf_auto_click_check.pack(side=tk.LEFT, padx=(10, 0))
+        self.keep_cf_cookies_check = tk_checkbutton(opt_box, text="保留CF Cookie", variable=self.keep_cf_cookies_var)
+        self.keep_cf_cookies_check.pack(side=tk.LEFT, padx=(10, 0))
+        add_field(opt_box, 1, 1, sticky=tk.W)
 
         add_label(1, 2, "代理（可选）:")
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
@@ -3348,6 +3380,8 @@ class GrokRegisterGUI:
 
         config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
+        config["cf_auto_click"] = bool(self.cf_auto_click_var.get())
+        config["keep_cf_cookies"] = bool(self.keep_cf_cookies_var.get())
         config["proxy"] = self.proxy_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()

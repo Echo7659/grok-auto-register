@@ -7,10 +7,14 @@ points at a directory that *contains* the `cpa_xai` package.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
@@ -62,6 +66,70 @@ def export_cookies_from_page(page: Any) -> list[dict]:
     if isinstance(cookies, list):
         return [c for c in cookies if isinstance(c, dict)]
     return []
+
+
+def upload_cpa_auth_to_management(
+    local_path: str | Path,
+    cfg: dict,
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
+    """通过 CLIProxyAPI 管理接口上传单个凭证文件。"""
+    log = log_callback or (lambda _m: None)
+    base = str(cfg.get("cpa_management_base") or "").strip().rstrip("/")
+    key = str(cfg.get("cpa_management_key") or "").strip()
+    if not base:
+        raise RuntimeError("cpa_management_base 未配置")
+    if not key:
+        raise RuntimeError("cpa_management_key 未配置")
+
+    source = Path(local_path).expanduser().resolve()
+    if not source.is_file() or source.suffix.lower() != ".json":
+        raise RuntimeError(f"CPA 凭证文件无效: {source.name}")
+    data = source.read_bytes()
+    try:
+        json.loads(data.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"CPA 凭证不是有效 JSON: {source.name}") from exc
+
+    timeout = max(3.0, float(cfg.get("cpa_management_timeout_sec", 15) or 15))
+    endpoint = (
+        f"{base}/v0/management/auth-files?"
+        f"name={urllib.parse.quote(source.name, safe='')}"
+    )
+    request = urllib.request.Request(
+        endpoint,
+        data=data,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Management-Key": key,
+        },
+    )
+    if cfg.get("cpa_management_use_system_proxy", False):
+        opener = urllib.request.build_opener()
+    else:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", response.getcode()))
+            body = response.read(4096).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read(512).decode("utf-8", errors="replace")
+        raise RuntimeError(f"CPA 管理接口 HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"CPA 管理接口连接失败: {exc.reason}") from exc
+
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"CPA 管理接口 HTTP {status}: {body[:512]}")
+    try:
+        payload = json.loads(body) if body else {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"CPA 管理接口返回非 JSON: {body[:512]}") from exc
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"CPA 管理接口未确认导入: {payload}")
+    log(f"[cpa] 管理接口已导入: {source.name}")
 
 
 def export_cpa_xai_for_account(
@@ -201,6 +269,16 @@ def export_cpa_xai_for_account(
         except Exception as e:  # noqa: BLE001
             log(f"[cpa] hotload copy failed: {e}")
             result["cpa_copy_error"] = str(e)
+
+    if result.get("ok") and result.get("path") and cfg.get("cpa_management_auto_upload", False):
+        try:
+            upload_cpa_auth_to_management(result["path"], cfg, log)
+            result["cpa_management_uploaded"] = True
+        except Exception as e:  # noqa: BLE001
+            result["cpa_management_upload_error"] = str(e)
+            log(f"[cpa] 管理接口导入失败: {e}")
+            if cfg.get("cpa_management_upload_required", False):
+                result["ok"] = False
 
     if result.get("ok") and result.get("path") and cfg.get("cpa_server_host"):
         try:

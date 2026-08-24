@@ -723,72 +723,25 @@ def _wait_turnstile(
     On timeout: optionally screenshot + raise BrowserConfirmError so backfill
     skips this account instead of spinning until --timeout.
     """
-    deadline = time.time() + timeout
-    clicked = False
-    while time.time() < deadline:
-        try:
-            el = page.ele("css:input[name='cf-turnstile-response']", timeout=0.3)
-            if el is not None:
-                v = (el.attr("value") or "").strip()
-                if len(v) > 20:
-                    log(f"turnstile ready len={len(v)}")
-                    return True
-        except Exception:
-            pass
+    try:
+        root = str(_project_root())
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from cf_turnstile import is_turnstile_token_ready, solve_turnstile
 
-        # Mimic register-machine: shadow-root checkbox click
-        try:
-            challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.2)
-            if challenge_input is not None:
-                wrapper = challenge_input.parent()
-                iframe = None
-                try:
-                    iframe = wrapper.shadow_root.ele("tag:iframe")
-                except Exception:
-                    iframe = None
-                if iframe is not None:
-                    try:
-                        iframe.run_js(
-                            """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-                            """
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn is not None:
-                            btn.click()
-                            if not clicked:
-                                log("clicked turnstile shadow checkbox")
-                                clicked = True
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        if not clicked:
-            try:
-                page.run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
-                )
-                clicked = True
-                log("clicked turnstile container via JS")
-            except Exception:
-                pass
-        _sleep(0.9)
+        token = solve_turnstile(
+            page,
+            timeout=timeout,
+            log=log,
+            auto_click=True,
+            os_click=True,
+            require=True,
+        )
+        if is_turnstile_token_ready(token) or (isinstance(token, str) and len(token) > 20):
+            log(f"turnstile ready len={len(token)}")
+            return True
+    except Exception as exc:
+        log(f"turnstile helper failed: {exc}")
     log("turnstile not ready")
     shot = _save_debug_shot(page, tag="turnstile-timeout", email=email, log=log)
     if raise_on_timeout:

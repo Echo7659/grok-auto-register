@@ -41,6 +41,12 @@
   "cpa_mint_browser_recycle_every": 15,
   "cpa_hotload_dir": "",
   "cpa_copy_to_hotload": false,
+  "cpa_management_auto_upload": false,
+  "cpa_management_base": "",
+  "cpa_management_key": "",
+  "cpa_management_timeout_sec": 15,
+  "cpa_management_use_system_proxy": false,
+  "cpa_management_upload_required": false,
   "cpa_server_host": "",
   "cpa_server_user": "root",
   "cpa_server_password": "",
@@ -51,5 +57,9 @@
   "cpa_mint_async": true,
   "browser_use_custom_ua": false,
   "log_level": "info",
-  "speed_log_interval_sec": 60
+  "speed_log_interval_sec": 60,
+  "cf_auto_click": true,
+  "keep_cf_cookies": true,
+  "cf_os_click": true,
+  "cf_turnstile_timeout_sec": 45
 }

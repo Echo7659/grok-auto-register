@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "turnstilePatch",
+  "version": "1.0",
+  "description": "Give CDP mouse events non-zero screenX/screenY so Turnstile can accept real clicks.",
+  "content_scripts": [
+    {
+      "js": ["script.js"],
+      "matches": ["http://*/*", "https://*/*"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true,
+      "world": "MAIN"
+    }
+  ]
+}

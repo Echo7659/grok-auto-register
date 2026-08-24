@@ -120,6 +120,10 @@ cp config.example.json config.json
 | `speed_log_interval_sec` | 创建速度统计间隔秒数，默认 `60`；输出类似 `成功 9/min` |
 | `browser_use_custom_ua` | 是否强制使用配置中的自定义 UA（默认 `false`，更贴近本机 Chrome） |
 | `token_only_file` | 仅写入 SSO token 的附加文件路径，可留空 |
+| `cf_auto_click` | 遇到 Cloudflare 人机验证时自动点击勾选框（默认 `true`） |
+| `keep_cf_cookies` | 账号间重启浏览器时保留 `cf_clearance` 等 CF cookie，清掉 SSO 登录态（默认 `true`） |
+| `cf_os_click` | 元素点击失败时用系统鼠标点验证框；窗口需在前台（默认 `true`） |
+| `cf_turnstile_timeout_sec` | 单次自动处理人机验证的超时秒数，默认 `45` |
 
 ### Cloudflare 临时邮箱匿名模式（默认）
 
@@ -273,6 +277,16 @@ CLI 模式只是不启动 Tk GUI。注册页、Turnstile、验证码提交和 SS
 
 常见原因是账号间会话残留（例如页面落到 `grok.com/tos-gate`）。当前版本在每个账号结束后都会完整重启浏览器；请确认使用最新代码，且不要改回「仅轻量清 cookie、不重启」。
 
+### Cloudflare 人机验证每次都要手点？
+
+注册页上的 Turnstile 勾选框会由程序自动点：先点 iframe 坐标，失败再用系统鼠标。请保持浏览器窗口在前台，不要最小化。
+
+- 确认项目里有 `turnstilePatch/` 扩展目录。
+- `cf_auto_click` / `keep_cf_cookies` 保持开启。
+- 单开时可用系统鼠标点击（需 macOS 辅助功能权限）；`concurrent_count > 1` 时会自动禁用系统鼠标，改用各浏览器独立 CDP 点击，避免点错窗口。
+- 多开 10 个浏览器可以跑：每个 worker 独立 Chromium / profile / CF cookie。但同一代理 IP 更容易被加强验证，建议住宅代理或降低并发；机器也要扛得住 10 个 Chrome。
+- 并发建议先用 `1` 验证流程，再逐步加大。
+
 ### NSFW 开启失败怎么办？
 
 如果日志显示 `Cloudflare 防护拦截，HTTP 403`，说明请求被目标站点防护拦截。程序会继续保存账号和写入 grok2api。
@@ -294,6 +308,8 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 ```text
 .
 ├── grok_register_ttk.py   # 主程序（GUI/CLI 注册）
+├── cf_turnstile.py        # Turnstile 检测 / 自动点击 / CF cookie
+├── turnstilePatch/        # CDP 鼠标坐标补丁扩展
 ├── cpa_export.py          # CPA xAI 导出入口
 ├── cpa_xai/               # CPA mint / OAuth / schema
 ├── cf_mail_debug.py       # Cloudflare 邮箱调试工具
