@@ -111,6 +111,44 @@ class CpaManagementUploadTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertTrue(result["cpa_management_uploaded"])
 
+    def test_required_management_upload_failure_sets_top_level_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            auth_file = Path(temp_dir) / "xai-user@example.com.json"
+            auth_file.write_text(
+                json.dumps({"type": "xai", "email": "user@example.com"}),
+                encoding="utf-8",
+            )
+            cfg = {
+                "cpa_export_enabled": True,
+                "cpa_auth_dir": temp_dir,
+                "cpa_management_auto_upload": True,
+                "cpa_management_upload_required": True,
+                "cpa_management_base": "http://cpa.example.com",
+                "cpa_management_key": "management-secret",
+            }
+            minted = {"ok": True, "path": str(auth_file)}
+
+            with patch("cpa_xai.mint_and_export", return_value=minted), patch.object(
+                cpa_export,
+                "upload_cpa_auth_to_management",
+                side_effect=RuntimeError("connection refused"),
+            ):
+                result = cpa_export.export_cpa_xai_for_account(
+                    "user@example.com",
+                    "password",
+                    config=cfg,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(
+                result["cpa_management_upload_error"],
+                "connection refused",
+            )
+            self.assertEqual(
+                result["error"],
+                "CPA 管理接口导入失败: connection refused",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -275,10 +275,12 @@ def export_cpa_xai_for_account(
             upload_cpa_auth_to_management(result["path"], cfg, log)
             result["cpa_management_uploaded"] = True
         except Exception as e:  # noqa: BLE001
-            result["cpa_management_upload_error"] = str(e)
-            log(f"[cpa] 管理接口导入失败: {e}")
+            upload_error = str(e)
+            result["cpa_management_upload_error"] = upload_error
+            log(f"[cpa] 管理接口导入失败: {upload_error}")
             if cfg.get("cpa_management_upload_required", False):
                 result["ok"] = False
+                result["error"] = f"CPA 管理接口导入失败: {upload_error}"
 
     if result.get("ok") and result.get("path") and cfg.get("cpa_server_host"):
         try:
