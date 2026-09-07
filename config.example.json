@@ -2,6 +2,8 @@
   "platform": "grok",
   "fish_auth_dir": "fish_auths",
   "fish_session_ttl_sec": 604800,
+  "eleven_auth_dir": "eleven_auths",
+  "eleven_session_ttl_sec": 3600,
   "duckmail_api_key": "",
   "mailtm_api_base": "https://api.mail.tm",
   "onesecmail_api_base": "https://www.1secmail.com/api/v1/",

@@ -38,7 +38,7 @@ from curl_cffi import requests
 
 import cf_turnstile
 import temp_mail_providers
-from platforms import fishaudio
+from platforms import elevenlabs, fishaudio
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -48,6 +48,8 @@ DEFAULT_CONFIG = {
     "platform": "grok",
     "fish_auth_dir": "fish_auths",
     "fish_session_ttl_sec": 604800,
+    "eleven_auth_dir": "eleven_auths",
+    "eleven_session_ttl_sec": 3600,
     "email_provider": "duckmail",
     "yyds_api_key": "",
     "yyds_jwt": "",
@@ -1416,6 +1418,13 @@ def extract_verification_code(text, subject="", *, prefer_fish_otp=None):
         fish_code = fishaudio.extract_fish_otp(text, subject)
         if fish_code:
             return fish_code
+    if get_platform() == "elevenlabs":
+        link = elevenlabs.extract_verification_link(text, subject)
+        if link:
+            return link
+        eleven_code = elevenlabs.extract_eleven_otp(text, subject)
+        if eleven_code:
+            return eleven_code
     if subject:
         match = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", subject, re.IGNORECASE)
         if match:
@@ -3426,7 +3435,12 @@ class GrokRegisterGUI:
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         platform = get_platform()
-        prefix = "accounts_fish" if platform == "fishaudio" else "accounts"
+        if platform == "fishaudio":
+            prefix = "accounts_fish"
+        elif platform == "elevenlabs":
+            prefix = "accounts_eleven"
+        else:
+            prefix = "accounts"
         self.accounts_output_file = os.path.join(
             os.path.dirname(__file__), f"{prefix}_{now}.txt"
         )
@@ -3437,6 +3451,8 @@ class GrokRegisterGUI:
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
         if platform == "fishaudio":
             self.log(f"[*] Fish 授权目录: {config.get('fish_auth_dir', 'fish_auths')}")
+        elif platform == "elevenlabs":
+            self.log(f"[*] ElevenLabs 授权目录: {config.get('eleven_auth_dir', 'eleven_auths')}")
         threading.Thread(
             target=self.run_registration,
             args=(count,),
@@ -3584,8 +3600,19 @@ class GrokRegisterGUI:
             stop_browser()
 
     def _register_one_account(self, log_fn, worker_id=0, local_success=0):
-        if get_platform() == "fishaudio":
+        platform = get_platform()
+        if platform == "fishaudio":
             result = _register_one_account_fish(
+                log_fn=log_fn,
+                cancel_callback=self.should_stop,
+                accounts_output_file=self.accounts_output_file,
+            )
+            with _stats_lock:
+                self.results.append(result)
+                self.success_count += 1
+            return
+        if platform == "elevenlabs":
+            result = _register_one_account_eleven(
                 log_fn=log_fn,
                 cancel_callback=self.should_stop,
                 accounts_output_file=self.accounts_output_file,
@@ -3964,9 +3991,132 @@ def _register_one_account_fish_body(log_fn, cancel_callback, accounts_output_fil
     }
 
 
+def _register_one_account_eleven(log_fn, cancel_callback, accounts_output_file):
+    """ElevenLabs: signup → email verify link → sign-in → web Firebase ID token JSON."""
+    try:
+        return _register_one_account_eleven_body(log_fn, cancel_callback, accounts_output_file)
+    except elevenlabs.ElevenCancelled as exc:
+        raise RegistrationCancelled(str(exc) or "用户停止注册") from exc
+
+
+def _register_one_account_eleven_body(log_fn, cancel_callback, accounts_output_file):
+    page = _get_page()
+    if page is None:
+        start_browser(log_callback=log_fn)
+        page = _get_page()
+    if page is None:
+        raise Exception("浏览器未启动")
+
+    password = elevenlabs.generate_password()
+    log_fn("[*] 1. 打开 ElevenLabs 注册页")
+    prepare_clean_browser_session(log_callback=log_fn, cancel_callback=cancel_callback)
+    page = _get_page()
+    elevenlabs.open_signup_page(page, log_callback=log_fn, cancel_callback=cancel_callback)
+
+    log_fn("[*] 2. 创建邮箱并提交注册表单")
+    email, dev_token = get_email_and_token()
+    if not email or not dev_token:
+        raise Exception("获取邮箱失败")
+    log_fn(f"[*] 邮箱: {email}")
+    _append_mail_credentials(email, dev_token)
+    elevenlabs.submit_signup_form(
+        page,
+        email,
+        password,
+        log_callback=log_fn,
+        cancel_callback=cancel_callback,
+    )
+
+    log_fn("[*] 3. 等待验证邮件链接")
+    # Prefer waiting until the "verification link sent" UI appears, then poll mailbox.
+    wait_deadline = time.time() + 90
+    while time.time() < wait_deadline:
+        raise_if_cancelled(cancel_callback)
+        step = elevenlabs.detect_step(page)
+        if step in ("verification", "signin", "app", "onboarding"):
+            break
+        sleep_with_cancel(1, cancel_callback)
+
+    try:
+        artifact = get_oai_code(
+            dev_token,
+            email,
+            timeout=180,
+            log_callback=log_fn,
+            cancel_callback=cancel_callback,
+        )
+    except Exception as mail_exc:
+        raise Exception(
+            "ElevenLabs 未收到验证邮件。"
+            f"常见阻塞：invisible hCaptcha / 临时域拒信。详情: {mail_exc}"
+        ) from mail_exc
+
+    artifact = str(artifact or "").strip()
+    if not (artifact.startswith("http://") or artifact.startswith("https://")):
+        raise Exception(f"ElevenLabs 验证邮件未解析到链接，收到: {artifact!r}")
+
+    log_fn(f"[*] 打开验证链接: {artifact[:120]}...")
+    page.get(artifact)
+    sleep_with_cancel(2, cancel_callback)
+
+    log_fn("[*] 4. 验邮后重新登录，收割网页 Firebase token")
+    elevenlabs.sign_in_form(
+        page,
+        email,
+        password,
+        log_callback=log_fn,
+        cancel_callback=cancel_callback,
+    )
+    session = elevenlabs.harvest_session(page, log_callback=log_fn, cancel_callback=cancel_callback)
+
+    ttl = int(config.get("eleven_session_ttl_sec", 3600) or 3600)
+    payload = elevenlabs.build_auth_payload(
+        email=email or session.get("email", ""),
+        id_token=session.get("id_token", ""),
+        refresh_token=session.get("refresh_token", ""),
+        user_id=session.get("user_id", ""),
+        workspace_id=session.get("workspace_id", ""),
+        auth_account_id=session.get("auth_account_id", ""),
+        session_ttl_sec=ttl,
+    )
+    auth_dir = str(config.get("eleven_auth_dir", "eleven_auths") or "eleven_auths").strip()
+    if not os.path.isabs(auth_dir):
+        auth_dir = os.path.join(os.path.dirname(__file__), auth_dir)
+    auth_path = elevenlabs.write_auth_file(auth_dir, payload)
+    log_fn(f"[+] ElevenLabs 网页授权已写入: {auth_path}")
+
+    line = (
+        f"{payload['email']}\t{password}\t{payload['access_token']}\t"
+        f"{payload.get('user_id','')}\t{payload.get('workspace_id','')}\n"
+    )
+    try:
+        with _io_lock:
+            with open(accounts_output_file, "a", encoding="utf-8") as handle:
+                handle.write(line)
+    except Exception as file_exc:
+        log_fn(f"[Debug] 保存账号文件失败: {file_exc}")
+
+    log_fn(f"[+] 注册成功: {payload['email']}")
+    return {
+        "email": payload["email"],
+        "password": password,
+        "token": payload["access_token"],
+        "auth_path": auth_path,
+        "payload": payload,
+    }
+
+
 def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
-    if get_platform() == "fishaudio":
+    platform = get_platform()
+    if platform == "fishaudio":
         _register_one_account_fish(
+            log_fn=log_fn,
+            cancel_callback=stop_fn,
+            accounts_output_file=accounts_output_file,
+        )
+        return
+    if platform == "elevenlabs":
+        _register_one_account_eleven(
             log_fn=log_fn,
             cancel_callback=stop_fn,
             accounts_output_file=accounts_output_file,
@@ -4135,7 +4285,12 @@ def run_registration_cli(count):
     platform = get_platform()
     controller = CliStopController()
     prev_handler = _install_cli_sigint_handler(controller)
-    prefix = "accounts_fish" if platform == "fishaudio" else "accounts"
+    if platform == "fishaudio":
+        prefix = "accounts_fish"
+    elif platform == "elevenlabs":
+        prefix = "accounts_eleven"
+    else:
+        prefix = "accounts"
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
         f"{prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
@@ -4162,6 +4317,8 @@ def run_registration_cli(count):
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     if platform == "fishaudio":
         cli_log(f"[*] Fish 授权目录: {config.get('fish_auth_dir', 'fish_auths')}")
+    elif platform == "elevenlabs":
+        cli_log(f"[*] ElevenLabs 授权目录: {config.get('eleven_auth_dir', 'eleven_auths')}")
     cli_log(f"[*] 日志级别: {get_log_level()} | 速度统计间隔: {int(interval)}s")
     cli_log("[*] 按 Ctrl+C 停止（连按两次强制退出）")
     try:

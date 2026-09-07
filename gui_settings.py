@@ -10,8 +10,9 @@ UI_PANEL_BG = "#ffffff"
 UI_FG = "#172235"
 UI_MUTED_FG = "#526078"
 IMPORT_TARGETS = {"CPA": "cpa", "grok2api": "grok2api", "CPA + grok2api": "both", "不自动导入": "none"}
-PLATFORMS = {"Grok": "grok", "Fish Audio": "fishaudio"}
+PLATFORMS = {"Grok": "grok", "Fish Audio": "fishaudio", "ElevenLabs": "elevenlabs"}
 PLATFORM_LABELS = {value: label for label, value in PLATFORMS.items()}
+LOCAL_AUTH_PLATFORMS = {"fishaudio", "elevenlabs"}
 
 
 def setup_light_theme(root):
@@ -91,7 +92,13 @@ def normalize_platform(value):
     raw = text.lower().replace(" ", "_").replace("-", "_")
     if raw in ("fish", "fishaudio", "fish_audio"):
         return "fishaudio"
+    if raw in ("eleven", "elevenlabs", "eleven_labs", "11labs"):
+        return "elevenlabs"
     return "grok"
+
+
+def is_local_auth_platform(platform):
+    return normalize_platform(platform) in LOCAL_AUTH_PLATFORMS
 
 
 def validate_config(values):
@@ -149,6 +156,9 @@ def validate_config(values):
 
     if platform == "fishaudio":
         require("fish_auth_dir", "Fish Audio 授权输出目录")
+        return
+    if platform == "elevenlabs":
+        require("eleven_auth_dir", "ElevenLabs 授权输出目录")
         return
 
     if values.get("grok2api_auto_add_remote"):
@@ -357,13 +367,26 @@ class SettingsPanel(ttk.Frame):
         self._field(self.fish_frame, "fish_auth_dir", "授权输出目录", path="directory")
         self._field(self.fish_frame, "fish_session_ttl_sec", "Session 有效期（秒）", minimum=60)
 
+        self._section(
+            body,
+            "ElevenLabs 输出",
+            "仅 ElevenLabs 平台使用；成功后写入网页 Firebase ID Token（Authorization: Bearer），不是开发者 API Key。",
+        )
+        self.eleven_frame = ttk.Frame(body)
+        self.eleven_frame.columnconfigure(1, weight=1)
+        self.eleven_frame.grid(row=self.rows[body], column=0, columnspan=2, sticky="ew")
+        self.rows[body] += 1
+        self.rows[self.eleven_frame] = 0
+        self._field(self.eleven_frame, "eleven_auth_dir", "授权输出目录", path="directory")
+        self._field(self.eleven_frame, "eleven_session_ttl_sec", "ID Token 有效期（秒）", minimum=60)
+
     def _build_mail(self):
         body = self.tabs["邮箱服务"][0]
         self._section(
             body,
             "邮箱服务",
             "仅启用当前服务商对应的配置；切换服务商会保留已填写的内容。"
-            "Mail.tm / 1secMail 通常无需密钥；Fish Audio 若拒收公开临时域，优先用 Cloudflare 自有域名。",
+            "Mail.tm / 1secMail 通常无需密钥；Fish Audio / ElevenLabs 若拒收公开临时域，优先用 Cloudflare 自有域名。",
         )
         self._field(
             body,
@@ -401,10 +424,10 @@ class SettingsPanel(ttk.Frame):
 
     def _build_import(self):
         body = self.tabs["自动导入"][0]
-        self._section(body, "注册成功后的导入目标", "CPA 会先生成本地凭证，再按选项导入；grok2api 使用 SSO token 入池。Fish Audio 仅写本地授权文件。")
+        self._section(body, "注册成功后的导入目标", "CPA 会先生成本地凭证，再按选项导入；grok2api 使用 SSO token 入池。Fish Audio / ElevenLabs 仅写本地授权文件。")
         self.import_hint = ttk.Label(
             body,
-            text="当前平台为 Fish Audio：跳过 CPA / grok2api 导入，仅写入 fish_auth_dir。",
+            text="当前平台为本地授权模式：跳过 CPA / grok2api 导入，仅写入平台授权目录。",
             style="Hint.TLabel",
             wraplength=720,
         )
@@ -482,26 +505,33 @@ class SettingsPanel(ttk.Frame):
     def _update_visibility(self):
         platform = self.current_platform()
         is_fish = platform == "fishaudio"
+        is_eleven = platform == "elevenlabs"
+        is_local_auth = is_local_auth_platform(platform)
         target = IMPORT_TARGETS[self.target_var.get()]
         if hasattr(self, "fish_frame"):
             if is_fish:
                 self.fish_frame.grid()
             else:
                 self.fish_frame.grid_remove()
+        if hasattr(self, "eleven_frame"):
+            if is_eleven:
+                self.eleven_frame.grid()
+            else:
+                self.eleven_frame.grid_remove()
         if hasattr(self, "import_hint"):
-            if is_fish:
+            if is_local_auth:
                 self.import_hint.grid()
                 self.target_combo.configure(state="disabled")
             else:
                 self.import_hint.grid_remove()
                 self.target_combo.configure(state="readonly")
         if hasattr(self, "cpa_advanced_frame"):
-            if is_fish:
+            if is_local_auth:
                 self.cpa_advanced_frame.grid_remove()
             else:
                 self.cpa_advanced_frame.grid()
         for name, frame in self.import_frames.items():
-            if is_fish:
+            if is_local_auth:
                 frame.grid_remove()
             elif target in (name, "both"):
                 frame.grid()
@@ -515,19 +545,21 @@ class SettingsPanel(ttk.Frame):
         for key, (controls, normal_state) in self.fields.items():
             enabled = True
             if key == "enable_nsfw":
-                enabled = not is_fish
+                enabled = not is_local_auth
             elif key == "token_only_file":
-                enabled = not is_fish
+                enabled = not is_local_auth
             elif key.startswith("fish_"):
                 enabled = is_fish
+            elif key.startswith("eleven_"):
+                enabled = is_eleven
             elif key.startswith("cpa_"):
-                enabled = (not is_fish) and target in ("cpa", "both")
+                enabled = (not is_local_auth) and target in ("cpa", "both")
                 if key.startswith("cpa_management_") and key != "cpa_management_auto_upload":
                     enabled = enabled and self.variables["cpa_management_auto_upload"].get()
                 if key == "cpa_hotload_dir":
                     enabled = enabled and self.variables["cpa_copy_to_hotload"].get()
             elif key.startswith("grok2api_"):
-                enabled = not is_fish
+                enabled = not is_local_auth
                 if key in ("grok2api_remote_base", "grok2api_remote_app_key"):
                     enabled = enabled and self.variables["grok2api_auto_add_remote"].get()
                 elif key == "grok2api_local_token_file":
@@ -564,7 +596,7 @@ class SettingsPanel(ttk.Frame):
                 value = value.strip()
             values[key] = value
         values["platform"] = self.current_platform()
-        if values["platform"] == "fishaudio":
+        if is_local_auth_platform(values["platform"]):
             values = apply_import_target(values, "none")
         else:
             target = IMPORT_TARGETS[self.target_var.get()]

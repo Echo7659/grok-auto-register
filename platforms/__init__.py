@@ -1,5 +1,5 @@
 """Platform-specific registration helpers."""
 
-from . import fishaudio
+from . import elevenlabs, fishaudio
 
-__all__ = ["fishaudio"]
+__all__ = ["fishaudio", "elevenlabs"]

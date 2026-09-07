@@ -14,7 +14,9 @@ mail_credentials.txt
 
 cpa_auths/
 fish_auths/
+eleven_auths/
 screenshots/
+work/
 
 config.json
 config.local.json
