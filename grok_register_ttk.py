@@ -22,7 +22,13 @@ import string
 import json
 import tempfile
 
-from gui_settings import SettingsPanel, UI_MUTED_FG, setup_light_theme
+from gui_settings import (
+    PLATFORM_LABELS,
+    SettingsPanel,
+    UI_MUTED_FG,
+    normalize_platform,
+    setup_light_theme,
+)
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -31,17 +37,24 @@ from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 
 import cf_turnstile
+import temp_mail_providers
+from platforms import fishaudio
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
 
 DEFAULT_CONFIG = {
+    "platform": "grok",
+    "fish_auth_dir": "fish_auths",
+    "fish_session_ttl_sec": 604800,
     "email_provider": "duckmail",
     "yyds_api_key": "",
     "yyds_jwt": "",
     "defaultDomains": "",
     "duckmail_api_key": "",
+    "mailtm_api_base": "https://api.mail.tm",
+    "onesecmail_api_base": "https://www.1secmail.com/api/v1/",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
@@ -1245,13 +1258,49 @@ def pick_domain(api_key=None):
 
 
 def get_email_provider():
-    return config.get("email_provider", "duckmail")
+    raw = str(config.get("email_provider", "duckmail") or "duckmail").strip().lower()
+    if raw in ("1secmail", "one_sec_mail", "1sec_mail"):
+        return "onesecmail"
+    return raw
+
+
+def get_platform():
+    return normalize_platform(config.get("platform", "grok"))
+
+
+def platform_display_name(platform=None):
+    value = normalize_platform(platform if platform is not None else get_platform())
+    return PLATFORM_LABELS.get(value, "Grok")
+
+
+def get_mailtm_api_base():
+    return str(
+        config.get("mailtm_api_base", temp_mail_providers.DEFAULT_MAILTM_API_BASE)
+        or temp_mail_providers.DEFAULT_MAILTM_API_BASE
+    ).strip()
+
+
+def get_onesecmail_api_base():
+    return str(
+        config.get(
+            "onesecmail_api_base", temp_mail_providers.DEFAULT_ONESECMAIL_API_BASE
+        )
+        or temp_mail_providers.DEFAULT_ONESECMAIL_API_BASE
+    ).strip()
 
 
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
+    if provider == "mailtm":
+        return temp_mail_providers.mailtm_create_email_and_token(
+            http_get, http_post, api_base=get_mailtm_api_base()
+        )
+    if provider in ("onesecmail", "1secmail"):
+        return temp_mail_providers.onesecmail_create_email_and_token(
+            http_get, api_base=get_onesecmail_api_base()
+        )
     if provider == "cloudflare":
         api_base = get_cloudflare_api_base()
         if not api_base:
@@ -1288,7 +1337,7 @@ def get_email_and_token(api_key=None):
     create_account(address, password, api_key=key, expires_in=0)
     token = get_token(address, password)
     if not token:
-        raise Exception("鑾峰彇 DuckMail token 澶辫触")
+        raise Exception("获取 DuckMail token 失败")
     return address, token
 
 
@@ -1312,6 +1361,34 @@ def get_oai_code(
             jwt=get_yyds_jwt(),
             cancel_callback=cancel_callback,
         )
+    if provider == "mailtm":
+        return temp_mail_providers.mailtm_get_oai_code(
+            http_get=http_get,
+            token=dev_token,
+            email=email,
+            extract_code=extract_verification_code,
+            sleep_with_cancel=sleep_with_cancel,
+            raise_if_cancelled=raise_if_cancelled,
+            api_base=get_mailtm_api_base(),
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+    if provider in ("onesecmail", "1secmail"):
+        return temp_mail_providers.onesecmail_get_oai_code(
+            http_get=http_get,
+            token=dev_token,
+            email=email,
+            extract_code=extract_verification_code,
+            sleep_with_cancel=sleep_with_cancel,
+            raise_if_cancelled=raise_if_cancelled,
+            api_base=get_onesecmail_api_base(),
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
     if provider == "cloudflare":
         return cloudflare_get_oai_code(
             dev_token,
@@ -1332,7 +1409,13 @@ def get_oai_code(
     )
 
 
-def extract_verification_code(text, subject=""):
+def extract_verification_code(text, subject="", *, prefer_fish_otp=None):
+    if prefer_fish_otp is None:
+        prefer_fish_otp = get_platform() == "fishaudio"
+    if prefer_fish_otp:
+        fish_code = fishaudio.extract_fish_otp(text, subject)
+        if fish_code:
+            return fish_code
     if subject:
         match = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", subject, re.IGNORECASE)
         if match:
@@ -1341,14 +1424,20 @@ def extract_verification_code(text, subject=""):
     if match:
         return match.group(1)
     patterns = [
+        r"(?:验证码|校[验驗]码)\s*[:：]?\s*(\d{4,8})",
         r"verification\s+code[:\s]+(\d{4,8})",
         r"your\s+code[:\s]+(\d{4,8})",
         r"confirm(?:ation)?\s+code[:\s]+(\d{4,8})",
+        r"\botp[:\s]+(\d{4,8})",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return match.group(1)
+    if not prefer_fish_otp:
+        fish_code = fishaudio.extract_fish_otp(text, subject)
+        if fish_code:
+            return fish_code
     return None
 
 
@@ -3056,7 +3145,7 @@ return 'final-page-clicked-submit';
 class GrokRegisterGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Grok 注册机")
+        self.root.title("注册机")
         self.root.geometry("1120x900")
         self.root.minsize(860, 650)
         self.is_running = False
@@ -3090,7 +3179,10 @@ class GrokRegisterGUI:
         header = ttk.Frame(main_frame, style="Shell.TFrame")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Grok 注册机", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        initial_platform = platform_display_name(values.get("platform", "grok"))
+        self.root.title(f"{initial_platform} 注册机")
+        self.title_label = ttk.Label(header, text=f"{initial_platform} 注册机", style="Title.TLabel")
+        self.title_label.grid(row=0, column=0, sticky="w")
         ttk.Label(header, text="任务配置与凭证导入", style="Source.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 7))
         self.source_label = ttk.Label(header, text=f"配置文件  {CONFIG_FILE}", style="Source.TLabel")
         self.source_label.grid(row=2, column=0, columnspan=2, sticky="ew")
@@ -3207,11 +3299,18 @@ class GrokRegisterGUI:
         messagebox.showerror("配置需要同步", message, parent=self.root)
         return False
 
+    def _refresh_platform_title(self, platform=None):
+        name = platform_display_name(platform)
+        self.root.title(f"{name} 注册机")
+        if hasattr(self, "title_label"):
+            self.title_label.configure(text=f"{name} 注册机")
+
     def _mark_settings_saved(self, values):
         self.settings.load_values(values)
         self.settings_dirty = False
         self.config_signature = config_file_signature()
         self.observed_signature = self.config_signature
+        self._refresh_platform_title(values.get("platform"))
 
     def _drain_ui_queue(self):
         """在 Tk 主线程处理后台日志和运行状态。"""
@@ -3225,6 +3324,8 @@ class GrokRegisterGUI:
 
     def _settings_changed(self):
         self.settings_dirty = True
+        if hasattr(self, "settings"):
+            self._refresh_platform_title(self.settings.current_platform())
         if not hasattr(self, "config_status_var"):
             return
         text = "有未保存的修改"
@@ -3324,13 +3425,18 @@ class GrokRegisterGUI:
         self.fail_count = 0
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        platform = get_platform()
+        prefix = "accounts_fish" if platform == "fishaudio" else "accounts"
         self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
+            os.path.dirname(__file__), f"{prefix}_{now}.txt"
         )
         self.update_stats()
         self._set_running_ui(True)
-        self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
+        self.root.title(f"{platform_display_name(platform)} 注册机")
+        self.log(f"[*] 配置已保存，开始执行。平台: {platform_display_name(platform)}，目标数量: {count}")
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
+        if platform == "fishaudio":
+            self.log(f"[*] Fish 授权目录: {config.get('fish_auth_dir', 'fish_auths')}")
         threading.Thread(
             target=self.run_registration,
             args=(count,),
@@ -3478,6 +3584,16 @@ class GrokRegisterGUI:
             stop_browser()
 
     def _register_one_account(self, log_fn, worker_id=0, local_success=0):
+        if get_platform() == "fishaudio":
+            result = _register_one_account_fish(
+                log_fn=log_fn,
+                cancel_callback=self.should_stop,
+                accounts_output_file=self.accounts_output_file,
+            )
+            with _stats_lock:
+                self.results.append(result)
+                self.success_count += 1
+            return
         email = ""
         dev_token = ""
         code = ""
@@ -3704,7 +3820,158 @@ def _restore_sigint_handler(previous):
         pass
 
 
+def _append_mail_credentials(email, dev_token):
+    try:
+        with _io_lock:
+            with open(
+                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(f"{email}\t{dev_token}\n")
+    except Exception:
+        pass
+
+
+def _register_one_account_fish(log_fn, cancel_callback, accounts_output_file):
+    """Fish Audio: email OTP signup → local session auth JSON."""
+    try:
+        return _register_one_account_fish_body(log_fn, cancel_callback, accounts_output_file)
+    except fishaudio.FishCancelled as exc:
+        raise RegistrationCancelled(str(exc) or "用户停止注册") from exc
+
+
+def _register_one_account_fish_body(log_fn, cancel_callback, accounts_output_file):
+    page = _get_page()
+    if page is None:
+        start_browser(log_callback=log_fn)
+        page = _get_page()
+    if page is None:
+        raise Exception("浏览器未启动")
+
+    mail_ok = False
+    email = ""
+    dev_token = ""
+    code = ""
+    password = fishaudio.generate_password()
+    max_mail_retry = 3
+    for mail_try in range(1, max_mail_retry + 1):
+        raise_if_cancelled(cancel_callback)
+        log_fn(f"[*] 1. 打开 Fish Audio 注册页 (尝试 {mail_try}/{max_mail_retry})")
+        prepare_clean_browser_session(log_callback=log_fn, cancel_callback=cancel_callback)
+        page = _get_page()
+        fishaudio.open_signup_page(page, log_callback=log_fn, cancel_callback=cancel_callback)
+
+        log_fn("[*] 2. 创建邮箱并提交")
+        email, dev_token = get_email_and_token()
+        if not email or not dev_token:
+            raise Exception("获取邮箱失败")
+        log_fn(f"[*] 邮箱: {email}")
+        _append_mail_credentials(email, dev_token)
+        fishaudio.submit_email(page, email, log_callback=log_fn, cancel_callback=cancel_callback)
+
+        log_fn("[*] 3. 拉取验证码")
+        try:
+            def _resend():
+                try:
+                    return bool(
+                        page.run_js(
+                            """
+(() => {
+  const links = Array.from(document.querySelectorAll('a, button'));
+  const node = links.find((n) => /重新发送|resend/i.test((n.innerText || '').trim()));
+  if (!node || node.getAttribute('aria-disabled') === 'true') return false;
+  if (/\\d+s/.test((node.innerText || ''))) return false;
+  node.click();
+  return true;
+})()
+"""
+                        )
+                    )
+                except Exception:
+                    return False
+
+            code = get_oai_code(
+                dev_token,
+                email,
+                timeout=180,
+                log_callback=log_fn,
+                cancel_callback=cancel_callback,
+                resend_callback=_resend,
+            )
+            code = re.sub(r"\D", "", str(code or ""))
+            if len(code) != 6:
+                raise Exception(f"Fish 验证码格式异常: {code!r}")
+            fishaudio.submit_otp(page, code, log_callback=log_fn, cancel_callback=cancel_callback)
+            mail_ok = True
+            break
+        except RegistrationCancelled:
+            raise
+        except fishaudio.FishCancelled:
+            raise
+        except Exception as mail_exc:
+            msg = str(mail_exc)
+            if ("未收到验证码" in msg or "验证码" in msg or "OTP" in msg) and mail_try < max_mail_retry:
+                log_fn(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                restart_browser(log_callback=log_fn)
+                sleep_with_cancel(1, cancel_callback)
+                page = _get_page()
+                continue
+            raise
+    if not mail_ok:
+        raise Exception("验证码阶段失败，已达到最大重试次数")
+
+    log_fn(f"[*] 验证码: {code}")
+    log_fn("[*] 4. 设置密码并完成注册")
+    fishaudio.submit_password(page, password, log_callback=log_fn, cancel_callback=cancel_callback)
+    session = fishaudio.harvest_session(page, log_callback=log_fn, cancel_callback=cancel_callback)
+
+    ttl = int(config.get("fish_session_ttl_sec", 604800) or 604800)
+    payload = fishaudio.build_auth_payload(
+        email=email,
+        token=session.get("token", ""),
+        user_id=session.get("user_id", ""),
+        active_team_id=session.get("active_team_id", ""),
+        active_workspace_id=session.get("active_workspace_id", ""),
+        session_ttl_sec=ttl,
+    )
+    auth_dir = str(config.get("fish_auth_dir", "fish_auths") or "fish_auths").strip()
+    if not os.path.isabs(auth_dir):
+        auth_dir = os.path.join(os.path.dirname(__file__), auth_dir)
+    auth_path = fishaudio.write_auth_file(auth_dir, payload)
+    log_fn(f"[+] Fish 授权已写入: {auth_path}")
+
+    team = session.get("active_team_id") or payload.get("project_id") or ""
+    workspace = session.get("active_workspace_id") or payload.get("project_id") or ""
+    # Use tabs so passwords containing '-' stay unambiguous.
+    line = (
+        f"{email}\t{password}\t{payload['access_token']}\t{team}\t{workspace}\n"
+    )
+    try:
+        with _io_lock:
+            with open(accounts_output_file, "a", encoding="utf-8") as handle:
+                handle.write(line)
+    except Exception as file_exc:
+        log_fn(f"[Debug] 保存账号文件失败: {file_exc}")
+
+    log_fn(f"[+] 注册成功: {email}")
+    return {
+        "email": email,
+        "password": password,
+        "token": payload["access_token"],
+        "auth_path": auth_path,
+        "payload": payload,
+    }
+
+
 def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
+    if get_platform() == "fishaudio":
+        _register_one_account_fish(
+            log_fn=log_fn,
+            cancel_callback=stop_fn,
+            accounts_output_file=accounts_output_file,
+        )
+        return
     email = ""
     dev_token = ""
     code = ""
@@ -3718,15 +3985,7 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
             log_callback=log_fn, cancel_callback=stop_fn
         )
         log_fn(f"[*] 邮箱: {email}")
-        try:
-            with _io_lock:
-                with open(
-                    os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                    "a", encoding="utf-8",
-                ) as f:
-                    f.write(f"{email}\t{dev_token}\n")
-        except Exception:
-            pass
+        _append_mail_credentials(email, dev_token)
         log_fn("[*] 3. 拉取验证码")
         try:
             code = fill_code_and_submit(
@@ -3873,11 +4132,13 @@ def _cli_worker_loop(worker_id, task_queue, total_count, controller, accounts_ou
 
 
 def run_registration_cli(count):
+    platform = get_platform()
     controller = CliStopController()
     prev_handler = _install_cli_sigint_handler(controller)
+    prefix = "accounts_fish" if platform == "fishaudio" else "accounts"
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
-        f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        f"{prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
     worker_count = max(1, int(config.get("concurrent_count", 1) or 1))
     stats = {"success": 0, "fail": 0, "lock": threading.Lock()}
@@ -3894,8 +4155,13 @@ def run_registration_cli(count):
         stop_event=stop_speed,
         interval_sec=interval,
     )
-    cli_log(f"[*] 终端模式启动，目标数量: {count}，并发: {worker_count}")
+    cli_log(
+        f"[*] 终端模式启动，平台: {platform_display_name(platform)}，"
+        f"目标数量: {count}，并发: {worker_count}"
+    )
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
+    if platform == "fishaudio":
+        cli_log(f"[*] Fish 授权目录: {config.get('fish_auth_dir', 'fish_auths')}")
     cli_log(f"[*] 日志级别: {get_log_level()} | 速度统计间隔: {int(interval)}s")
     cli_log("[*] 按 Ctrl+C 停止（连按两次强制退出）")
     try:

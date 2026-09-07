@@ -35,6 +35,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - [环境要求](#环境要求)
 - [安装](#安装)
 - [配置](#配置)
+- [邮箱服务配置教程](#邮箱服务配置教程)
 - [运行](#运行)
 - [输出文件](#输出文件)
 - [稳定性机制](#稳定性机制)
@@ -48,14 +49,14 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 
 - 支持 GUI 图形界面运行。
 - 支持 CLI 终端运行，不启动 Tk GUI。
+- 支持平台切换：`Grok` / `Fish Audio`（配置项 `platform`）。
 - 注册流程使用 Chromium/Chrome 浏览器页面完成。
 - 支持多 worker 并发注册（`concurrent_count`），每个 worker 独立浏览器与隔离 profile。
-- 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口。
+- 支持 DuckMail、Mail.tm、1secMail、YYDS、Cloudflare 临时邮箱接口。
 - 支持验证码邮件轮询和解析。
-- 支持成功账号实时写入 `accounts_*.txt`。
-- 支持将 SSO token 写入 grok2api 本地或远端池。
-- 支持注册后尝试开启 NSFW。
-- 支持 CPA xAI 凭证异步导出（默认独立 mint 浏览器，不占用注册页）。
+- 支持成功账号实时写入 `accounts_*.txt`（Fish Audio 为 `accounts_fish_*.txt`）。
+- Grok：支持将 SSO token 写入 grok2api 本地或远端池；支持 NSFW；支持 CPA xAI 凭证异步导出。
+- Fish Audio：邮箱 OTP 注册后写出本地授权 JSON（`fish_auth_dir`，默认 `fish_auths/`），不创建 API Key、不做远端导入。
 - 支持日志级别（`quiet` / `info` / `debug`）与每分钟创建速度统计。
 - 支持页面卡住检测、当前账号重试、每账号浏览器重启和内存清理。
 
@@ -100,10 +101,10 @@ macOS 可使用项目虚拟环境启动：
 
 界面使用浅色高对比度控件，配置通过顶部四个等高导航按钮切换，内容较多时可滚动：
 
-- **基本设置**：注册数量、并发浏览器数、代理、NSFW、日志级别和输出文件。
-- **邮箱服务**：选择 DuckMail、YYDS 或 Cloudflare，仅显示对应的配置。
-- **自动导入**：选择 CPA、grok2api、两者同时或不自动导入。切换目标保留已填写的地址和密钥。
-- **高级设置**：浏览器、人机验证、CPA 凭证生成和可选 SSH 上传配置。
+- **基本设置**：注册平台（Grok / Fish Audio）、注册数量、并发浏览器数、代理、日志级别和输出文件；Fish Audio 另有授权输出目录。
+- **邮箱服务**：选择 DuckMail、Mail.tm、1secMail、YYDS 或 Cloudflare，仅显示对应的配置。
+- **自动导入**：Grok 可选 CPA、grok2api、两者同时或不自动导入；Fish Audio 仅写本地授权文件。
+- **高级设置**：浏览器、人机验证；Grok 另有 CPA 凭证生成和可选 SSH 上传配置。
 
 导入 CPA 时，选择 **CPA**，勾选 **自动导入 CPA**，填写 **CPA 管理地址**和 **Management Key**。管理地址可填站点根地址或 `/v0/management` 地址；凭证生成后会调用管理 API 导入，本地凭证仍保留。grok2api 的本地、远端入池均不会在仅选择 CPA 时执行。只需生成本地 CPA 文件时，取消勾选自动导入即可。
 
@@ -119,10 +120,15 @@ macOS 可使用项目虚拟环境启动：
 
 | 配置项 | 说明 |
 | --- | --- |
-| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare` |
+| `platform` | 注册平台：`grok`（默认）或 `fishaudio` |
+| `fish_auth_dir` | Fish Audio 授权 JSON 输出目录，默认 `fish_auths` |
+| `fish_session_ttl_sec` | Fish session 过期时长（秒），默认 `604800`（7 天） |
+| `email_provider` | 邮箱服务商：`duckmail`、`mailtm`、`onesecmail`、`yyds`、`cloudflare` |
+| `mailtm_api_base` | Mail.tm API 地址，默认 `https://api.mail.tm`（通常无需改） |
+| `onesecmail_api_base` | 1secMail API 地址，默认 `https://www.1secmail.com/api/v1/` |
 | `register_count` | 本次目标注册数量 |
 | `proxy` | 代理地址，可留空 |
-| `enable_nsfw` | 注册后是否尝试开启 NSFW |
+| `enable_nsfw` | 注册后是否尝试开启 NSFW（仅 Grok） |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
 | `cloudflare_auth_mode` | Cloudflare API 鉴权模式；默认 `none`，可选 `bearer`、`x-api-key`、`x-admin-auth`、`query-key` |
@@ -268,13 +274,89 @@ python grok_register_ttk.py
 
 GUI 模式会打开 Tkinter 窗口，适合手动调整配置和观察日志。日志同样受 `log_level` 过滤，并会打印全局创建速度。
 
+## 邮箱服务配置教程
+
+GUI 路径：**邮箱服务** 页 → **服务商** 下拉框。切换后只显示当前服务商字段，其它已填内容会保留。
+
+### 推荐顺序（尤其是 Fish Audio）
+
+1. **Cloudflare 自有域名**（最稳，不容易被目标站拒信）
+2. **Mail.tm**（免密钥，公开 API，适合兜底）
+3. **DuckMail / YYDS**（按你已有账号使用）
+4. **1secMail**（免密钥；官方接口在部分网络会 `403`，可换镜像 Base）
+
+### Mail.tm（推荐兜底）
+
+1. 打开 GUI → **邮箱服务**
+2. 服务商选择 `mailtm`
+3. `Mail.tm API Base` 保持默认：`https://api.mail.tm`
+4. 保存配置后开始注册
+
+无需 API Key。程序会自动：拉取域名 → 创建邮箱 → 取 token → 轮询验证码邮件。
+
+官方文档：<https://docs.mail.tm/>
+
+`config.json` 示例：
+
+```json
+{
+  "email_provider": "mailtm",
+  "mailtm_api_base": "https://api.mail.tm"
+}
+```
+
+### 1secMail
+
+1. GUI → **邮箱服务** → 服务商选择 `onesecmail`
+2. `1secMail API Base` 默认：`https://www.1secmail.com/api/v1/`
+3. 若日志出现 `403`，把 Base 换成你可用的兼容镜像地址（需同样支持 `genRandomMailbox` / `getMessages` / `readMessage`）
+4. 保存后开始注册
+
+无需 API Key。程序用 `genRandomMailbox` 创建地址，再按 `login` + `domain` 拉信。
+
+`config.json` 示例：
+
+```json
+{
+  "email_provider": "onesecmail",
+  "onesecmail_api_base": "https://www.1secmail.com/api/v1/"
+}
+```
+
+说明：官方 `1secmail.com` 目前对不少出口 IP 直接返回 403。若你这边不通，优先切回 **Mail.tm** 或 **Cloudflare 自有域名**。
+
+### DuckMail
+
+1. 服务商选择 `duckmail`
+2. 如有密钥则填写 `DuckMail API Key`（也可留空走匿名）
+3. 保存后开始
+
+### Cloudflare 自有域名（稳定首选）
+
+1. 服务商选择 `cloudflare`
+2. 填写你的临时邮 Worker / 站点：
+   - `Cloudflare API Base`
+   - `默认邮箱域名`（`defaultDomains`）
+   - 鉴权模式与 Key（按你的部署：`none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key`）
+3. 四个路径默认可用；若你改过路由再调整
+
+适合 Fish Audio 等容易拒收公开临时域的站点。
+
+### YYDS
+
+1. 服务商选择 `yyds`
+2. 填写 `YYDS API Key` 与 `YYDS JWT`
+3. 保存后开始
+
 ## 输出文件
 
 运行过程中会生成：
 
-- `accounts_*.txt`：成功账号、密码和 SSO token。
+- `accounts_*.txt`：Grok 成功账号、密码和 SSO token。
+- `accounts_fish_*.txt`：Fish Audio 成功账号行（`email----password----token----team----workspace`）。
+- `fish_auths/`：Fish Audio 授权 JSON（`platform=fishaudio` 时）。
 - `mail_credentials.txt`：临时邮箱凭证。
-- `cpa_auths/`：CPA xAI 凭证 JSON（开启 `cpa_export_enabled` 时）。
+- `cpa_auths/`：CPA xAI 凭证 JSON（Grok 且开启 `cpa_export_enabled` 时）。
 - `.browser_profiles/`：并发 worker 临时浏览器 profile（运行中生成，已 gitignore）。
 - `*.log`：可选日志文件。
 
@@ -328,11 +410,20 @@ CLI 模式只是不启动 Tk GUI。注册页、Turnstile、验证码提交和 SS
 
 GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `register_count`。
 
+### Mail.tm / 1secMail 收不到验证码？
+
+- 先看日志是否已成功创建邮箱；若卡在「拉取验证码」，多半是目标站拒收该临时域。
+- Fish Audio 对公开临时域不稳定：可多试几次，或改用 Cloudflare 自有域名。
+- 1secMail 若一创建就 `403`，换 `onesecmail_api_base` 或改用 `mailtm`。
+
 ## 目录结构
 
 ```text
 .
 ├── grok_register_ttk.py   # 主程序（GUI/CLI 注册）
+├── gui_settings.py        # GUI 配置表单
+├── temp_mail_providers.py # Mail.tm / 1secMail 邮箱实现
+├── platforms/             # 平台实现（含 Fish Audio）
 ├── cf_turnstile.py        # Turnstile 检测 / 自动点击 / CF cookie
 ├── turnstilePatch/        # CDP 鼠标坐标补丁扩展
 ├── cpa_export.py          # CPA xAI 导出入口

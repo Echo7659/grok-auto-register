@@ -168,11 +168,25 @@ class GuiSettingsTests(unittest.TestCase):
         self.gui.settings.variables["grok2api_auto_add_remote"].set(True)
         self.assertTrue(self.gui.save_settings())
         saved = json.loads(self.config_path.read_text())
+        self.assertEqual(saved.get("platform"), "grok")
         for key, variable in self.gui.settings.variables.items():
             with self.subTest(key=key):
                 expected = saved[key]
                 actual = variable.get()
                 self.assertEqual(actual, expected if isinstance(expected, bool) else str(expected))
+
+    def test_fish_platform_hides_grok_only_controls(self):
+        panel = self.gui.settings
+        panel.platform_var.set("Fish Audio")
+        self.root.update_idletasks()
+        self.assertEqual(panel.current_platform(), "fishaudio")
+        self.assertTrue(panel.fish_frame.grid_info())
+        self.assertFalse(panel.import_frames["cpa"].grid_info())
+        values = panel.collect()
+        self.assertEqual(values["platform"], "fishaudio")
+        self.assertFalse(values["cpa_export_enabled"])
+        self.assertFalse(values["grok2api_auto_add_local"])
+        self.assertFalse(values["grok2api_auto_add_remote"])
 
     def test_navigation_switching_does_not_edit_configuration(self):
         for index in (1, 3, 2, 0):

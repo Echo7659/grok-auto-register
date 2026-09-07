@@ -13,6 +13,7 @@ mail_credentials.txt
 !requirements.txt
 
 cpa_auths/
+fish_auths/
 screenshots/
 
 config.json

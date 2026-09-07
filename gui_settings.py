@@ -10,6 +10,8 @@ UI_PANEL_BG = "#ffffff"
 UI_FG = "#172235"
 UI_MUTED_FG = "#526078"
 IMPORT_TARGETS = {"CPA": "cpa", "grok2api": "grok2api", "CPA + grok2api": "both", "不自动导入": "none"}
+PLATFORMS = {"Grok": "grok", "Fish Audio": "fishaudio"}
+PLATFORM_LABELS = {value: label for label, value in PLATFORMS.items()}
 
 
 def setup_light_theme(root):
@@ -82,6 +84,16 @@ def apply_import_target(values, target):
     return result
 
 
+def normalize_platform(value):
+    text = str(value or "grok").strip()
+    if text in PLATFORMS:
+        return PLATFORMS[text]
+    raw = text.lower().replace(" ", "_").replace("-", "_")
+    if raw in ("fish", "fishaudio", "fish_audio"):
+        return "fishaudio"
+    return "grok"
+
+
 def validate_config(values):
     """校验执行所需字段；错误只包含字段名称，不包含密钥值。"""
     if values["concurrent_count"] > values["register_count"]:
@@ -101,12 +113,44 @@ def validate_config(values):
         if not valid:
             raise ValueError(f"{label}需要填写有效的 http:// 或 https:// 地址。")
 
-    if values.get("email_provider") == "cloudflare":
+    platform = normalize_platform(values.get("platform", "grok"))
+    values["platform"] = platform
+
+    provider = str(values.get("email_provider") or "duckmail").strip().lower()
+    values["email_provider"] = "onesecmail" if provider in ("1secmail", "one_sec_mail") else provider
+    if values["email_provider"] == "cloudflare":
         url("cloudflare_api_base", "Cloudflare API Base")
         for key in ("domains", "accounts", "token", "messages"):
             value = values.get("cloudflare_path_" + key, "")
             if not value.startswith("/"):
                 raise ValueError("Cloudflare 的四个接口路径均需以 / 开头。")
+    if values["email_provider"] == "mailtm":
+        raw = str(values.get("mailtm_api_base") or "https://api.mail.tm").strip() or "https://api.mail.tm"
+        values["mailtm_api_base"] = raw.rstrip("/")
+        try:
+            parsed = urlsplit(values["mailtm_api_base"])
+            valid = parsed.scheme in ("http", "https") and bool(parsed.hostname)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("Mail.tm API Base 需要填写有效的 http:// 或 https:// 地址。")
+    if values["email_provider"] == "onesecmail":
+        raw = str(values.get("onesecmail_api_base") or "https://www.1secmail.com/api/v1/").strip()
+        if not raw:
+            raw = "https://www.1secmail.com/api/v1/"
+        values["onesecmail_api_base"] = raw if raw.endswith("/") else raw + "/"
+        try:
+            parsed = urlsplit(values["onesecmail_api_base"])
+            valid = parsed.scheme in ("http", "https") and bool(parsed.hostname)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("1secMail API Base 需要填写有效的 http:// 或 https:// 地址。")
+
+    if platform == "fishaudio":
+        require("fish_auth_dir", "Fish Audio 授权输出目录")
+        return
+
     if values.get("grok2api_auto_add_remote"):
         url("grok2api_remote_base", "grok2api 远端 Base")
         require("grok2api_remote_app_key", "grok2api app_key")
@@ -159,6 +203,7 @@ class SettingsPanel(ttk.Frame):
         for variable in self.variables.values():
             variable.trace_add("write", self._changed)
         self.target_var.trace_add("write", self._changed)
+        self.platform_var.trace_add("write", self._changed)
         self._update_visibility()
         self._sync_navigation()
 
@@ -178,7 +223,15 @@ class SettingsPanel(ttk.Frame):
         try:
             self.base_values = dict(values)
             for key, variable in self.variables.items():
-                variable.set(values.get(key, ""))
+                value = values.get(key, "")
+                if key == "email_provider":
+                    provider = str(value or "duckmail").strip().lower()
+                    if provider in ("1secmail", "one_sec_mail", "1sec_mail"):
+                        provider = "onesecmail"
+                    value = provider
+                variable.set(value)
+            platform = normalize_platform(values.get("platform", "grok"))
+            self.platform_var.set(PLATFORM_LABELS.get(platform, "Grok"))
             target = infer_import_target(values)
             self.target_var.set(next(label for label, value in IMPORT_TARGETS.items() if value == target))
         finally:
@@ -272,6 +325,21 @@ class SettingsPanel(ttk.Frame):
     def _build_basic(self):
         body = self.tabs["基本设置"][0]
         self._section(body, "任务参数", "修改后可单独保存。开始注册时，自动保存并使用当前表单中的设置。")
+        platform = normalize_platform(self.base_values.get("platform", "grok"))
+        self.platform_var = tk.StringVar(self, value=PLATFORM_LABELS.get(platform, "Grok"))
+        row = self.rows[body]
+        self.rows[body] += 1
+        ttk.Label(body, text="注册平台").grid(row=row, column=0, sticky="w", padx=(0, 24), pady=5)
+        platform_box = ttk.Combobox(
+            body,
+            textvariable=self.platform_var,
+            values=list(PLATFORMS.keys()),
+            state="readonly",
+            width=24,
+            font=("Helvetica Neue", 13),
+        )
+        platform_box.grid(row=row, column=1, sticky="w", pady=5)
+        self.fields["platform"] = ([platform_box], "readonly")
         self._field(body, "register_count", "注册数量", minimum=1)
         self._field(body, "concurrent_count", "并发浏览器数", minimum=1)
         self._field(body, "proxy", "注册代理（可留空）")
@@ -280,13 +348,31 @@ class SettingsPanel(ttk.Frame):
         self._field(body, "log_level", "日志级别", choices=("quiet", "info", "debug"))
         self._field(body, "speed_log_interval_sec", "速度统计间隔（秒）", minimum=1)
         self._field(body, "token_only_file", "额外 token 输出文件", path="file")
+        self._section(body, "Fish Audio 输出", "仅 Fish Audio 平台使用；成功后写入本地授权 JSON。")
+        self.fish_frame = ttk.Frame(body)
+        self.fish_frame.columnconfigure(1, weight=1)
+        self.fish_frame.grid(row=self.rows[body], column=0, columnspan=2, sticky="ew")
+        self.rows[body] += 1
+        self.rows[self.fish_frame] = 0
+        self._field(self.fish_frame, "fish_auth_dir", "授权输出目录", path="directory")
+        self._field(self.fish_frame, "fish_session_ttl_sec", "Session 有效期（秒）", minimum=60)
 
     def _build_mail(self):
         body = self.tabs["邮箱服务"][0]
-        self._section(body, "邮箱服务", "仅启用当前服务商对应的配置；切换服务商会保留已填写的内容。")
-        self._field(body, "email_provider", "服务商", choices=("duckmail", "yyds", "cloudflare"))
+        self._section(
+            body,
+            "邮箱服务",
+            "仅启用当前服务商对应的配置；切换服务商会保留已填写的内容。"
+            "Mail.tm / 1secMail 通常无需密钥；Fish Audio 若拒收公开临时域，优先用 Cloudflare 自有域名。",
+        )
+        self._field(
+            body,
+            "email_provider",
+            "服务商",
+            choices=("duckmail", "mailtm", "onesecmail", "yyds", "cloudflare"),
+        )
         self.mail_frames = {}
-        for provider in ("duckmail", "yyds", "cloudflare"):
+        for provider in ("duckmail", "mailtm", "onesecmail", "yyds", "cloudflare"):
             frame = ttk.Frame(body)
             frame.columnconfigure(1, weight=1)
             frame.grid(row=self.rows[body], column=0, columnspan=2, sticky="ew")
@@ -294,6 +380,15 @@ class SettingsPanel(ttk.Frame):
             self.rows[frame] = 0
             self.mail_frames[provider] = frame
         self._field(self.mail_frames["duckmail"], "duckmail_api_key", "DuckMail API Key", secret=True)
+        self._field(self.mail_frames["mailtm"], "mailtm_api_base", "Mail.tm API Base")
+        self._field(self.mail_frames["onesecmail"], "onesecmail_api_base", "1secMail API Base")
+        ttk.Label(
+            self.mail_frames["onesecmail"],
+            text="官方接口若返回 403，可换成可用镜像地址；留空则用默认官方地址。",
+            style="Hint.TLabel",
+            wraplength=720,
+        ).grid(row=self.rows[self.mail_frames["onesecmail"]], column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.rows[self.mail_frames["onesecmail"]] += 1
         self._field(self.mail_frames["yyds"], "yyds_api_key", "YYDS API Key", secret=True)
         self._field(self.mail_frames["yyds"], "yyds_jwt", "YYDS JWT", secret=True)
         cf = self.mail_frames["cloudflare"]
@@ -306,7 +401,16 @@ class SettingsPanel(ttk.Frame):
 
     def _build_import(self):
         body = self.tabs["自动导入"][0]
-        self._section(body, "注册成功后的导入目标", "CPA 会先生成本地凭证，再按选项导入；grok2api 使用 SSO token 入池。")
+        self._section(body, "注册成功后的导入目标", "CPA 会先生成本地凭证，再按选项导入；grok2api 使用 SSO token 入池。Fish Audio 仅写本地授权文件。")
+        self.import_hint = ttk.Label(
+            body,
+            text="当前平台为 Fish Audio：跳过 CPA / grok2api 导入，仅写入 fish_auth_dir。",
+            style="Hint.TLabel",
+            wraplength=720,
+        )
+        self.import_hint.grid(row=self.rows[body], column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        self.rows[body] += 1
+        self.import_hint.grid_remove()
         target = infer_import_target(self.base_values)
         self.target_var = tk.StringVar(self, value=next(label for label, value in IMPORT_TARGETS.items() if value == target))
         self.target_combo = ttk.Combobox(body, textvariable=self.target_var, values=list(IMPORT_TARGETS), state="readonly", font=("Helvetica Neue", 13))
@@ -349,16 +453,21 @@ class SettingsPanel(ttk.Frame):
         self._field(body, "user_agent", "User-Agent")
         self._field(body, "cf_turnstile_timeout_sec", "人机验证超时（秒）", minimum=1)
         self._field(body, "browser_restart_every", "浏览器周期重启提示（账号数）", minimum=0)
-        self._section(body, "CPA 凭证生成", "导入目标包含 CPA 时生效；CPA 代理留空时沿用注册代理或环境代理。")
+        self.cpa_advanced_frame = ttk.Frame(body)
+        self.cpa_advanced_frame.columnconfigure(1, weight=1)
+        self.cpa_advanced_frame.grid(row=self.rows[body], column=0, columnspan=2, sticky="ew")
+        self.rows[body] += 1
+        self.rows[self.cpa_advanced_frame] = 0
+        self._section(self.cpa_advanced_frame, "CPA 凭证生成", "导入目标包含 CPA 时生效；CPA 代理留空时沿用注册代理或环境代理。")
         for key, label in (("cpa_mint_async", "后台生成凭证"), ("cpa_headless", "凭证浏览器无头模式"), ("cpa_probe_after_write", "生成后探测可用性"), ("cpa_force_standalone", "强制使用独立浏览器"), ("cpa_mint_cookie_inject", "注入注册 Cookie"), ("cpa_mint_browser_reuse", "复用凭证浏览器")):
-            self._field(body, key, label)
-        self._field(body, "cpa_proxy", "CPA 代理（可留空）")
-        self._field(body, "cpa_base_url", "CPA API Base")
-        self._field(body, "cpa_mint_timeout_sec", "凭证生成超时（秒）", minimum=1)
-        self._field(body, "cpa_mint_browser_recycle_every", "凭证浏览器回收间隔（账号数）", minimum=0)
-        self._section(body, "CPA SSH 上传（可选）", "这是另一种上传方式，可与管理 API 同时启用。主机留空时不执行 SSH 上传。")
+            self._field(self.cpa_advanced_frame, key, label)
+        self._field(self.cpa_advanced_frame, "cpa_proxy", "CPA 代理（可留空）")
+        self._field(self.cpa_advanced_frame, "cpa_base_url", "CPA API Base")
+        self._field(self.cpa_advanced_frame, "cpa_mint_timeout_sec", "凭证生成超时（秒）", minimum=1)
+        self._field(self.cpa_advanced_frame, "cpa_mint_browser_recycle_every", "凭证浏览器回收间隔（账号数）", minimum=0)
+        self._section(self.cpa_advanced_frame, "CPA SSH 上传（可选）", "这是另一种上传方式，可与管理 API 同时启用。主机留空时不执行 SSH 上传。")
         for key, label in (("cpa_server_host", "SSH 主机"), ("cpa_server_user", "SSH 用户"), ("cpa_server_password", "SSH 密码"), ("cpa_server_auth_dir", "SSH 远端凭证目录")):
-            self._field(body, key, label, secret=key.endswith("password"))
+            self._field(self.cpa_advanced_frame, key, label, secret=key.endswith("password"))
 
     def _changed(self, *_):
         if self.loading:
@@ -366,10 +475,35 @@ class SettingsPanel(ttk.Frame):
         self._update_visibility()
         self.on_change()
 
+    def current_platform(self):
+        label = self.platform_var.get()
+        return PLATFORMS.get(label) or normalize_platform(label)
+
     def _update_visibility(self):
+        platform = self.current_platform()
+        is_fish = platform == "fishaudio"
         target = IMPORT_TARGETS[self.target_var.get()]
+        if hasattr(self, "fish_frame"):
+            if is_fish:
+                self.fish_frame.grid()
+            else:
+                self.fish_frame.grid_remove()
+        if hasattr(self, "import_hint"):
+            if is_fish:
+                self.import_hint.grid()
+                self.target_combo.configure(state="disabled")
+            else:
+                self.import_hint.grid_remove()
+                self.target_combo.configure(state="readonly")
+        if hasattr(self, "cpa_advanced_frame"):
+            if is_fish:
+                self.cpa_advanced_frame.grid_remove()
+            else:
+                self.cpa_advanced_frame.grid()
         for name, frame in self.import_frames.items():
-            if target in (name, "both"):
+            if is_fish:
+                frame.grid_remove()
+            elif target in (name, "both"):
                 frame.grid()
             else:
                 frame.grid_remove()
@@ -380,16 +514,24 @@ class SettingsPanel(ttk.Frame):
                 frame.grid_remove()
         for key, (controls, normal_state) in self.fields.items():
             enabled = True
-            if key.startswith("cpa_"):
-                enabled = target in ("cpa", "both")
+            if key == "enable_nsfw":
+                enabled = not is_fish
+            elif key == "token_only_file":
+                enabled = not is_fish
+            elif key.startswith("fish_"):
+                enabled = is_fish
+            elif key.startswith("cpa_"):
+                enabled = (not is_fish) and target in ("cpa", "both")
                 if key.startswith("cpa_management_") and key != "cpa_management_auto_upload":
                     enabled = enabled and self.variables["cpa_management_auto_upload"].get()
                 if key == "cpa_hotload_dir":
                     enabled = enabled and self.variables["cpa_copy_to_hotload"].get()
-            elif key in ("grok2api_remote_base", "grok2api_remote_app_key"):
-                enabled = self.variables["grok2api_auto_add_remote"].get()
-            elif key == "grok2api_local_token_file":
-                enabled = self.variables["grok2api_auto_add_local"].get()
+            elif key.startswith("grok2api_"):
+                enabled = not is_fish
+                if key in ("grok2api_remote_base", "grok2api_remote_app_key"):
+                    enabled = enabled and self.variables["grok2api_auto_add_remote"].get()
+                elif key == "grok2api_local_token_file":
+                    enabled = enabled and self.variables["grok2api_auto_add_local"].get()
             elif key == "user_agent":
                 enabled = self.variables["browser_use_custom_ua"].get()
             for index, control in enumerate(controls):
@@ -421,9 +563,13 @@ class SettingsPanel(ttk.Frame):
             elif isinstance(value, str):
                 value = value.strip()
             values[key] = value
-        target = IMPORT_TARGETS[self.target_var.get()]
-        values = apply_import_target(values, target)
-        if target in ("grok2api", "both") and not (values["grok2api_auto_add_local"] or values["grok2api_auto_add_remote"]):
-            raise ValueError("请选择 grok2api 的本地或远端入池方式。")
+        values["platform"] = self.current_platform()
+        if values["platform"] == "fishaudio":
+            values = apply_import_target(values, "none")
+        else:
+            target = IMPORT_TARGETS[self.target_var.get()]
+            values = apply_import_target(values, target)
+            if target in ("grok2api", "both") and not (values["grok2api_auto_add_local"] or values["grok2api_auto_add_remote"]):
+                raise ValueError("请选择 grok2api 的本地或远端入池方式。")
         validate_config(values)
         return values
