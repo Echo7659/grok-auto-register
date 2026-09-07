@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
@@ -20,6 +20,9 @@ import random
 import re
 import string
 import json
+import tempfile
+
+from gui_settings import SettingsPanel, UI_MUTED_FG, setup_light_theme
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -33,15 +36,11 @@ import cf_turnstile
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
 
-UI_BG = "#242424"
-UI_PANEL_BG = "#2b2b2b"
-UI_FG = "#f2f2f2"
-UI_MUTED_FG = "#b8b8b8"
-UI_ENTRY_BG = "#333333"
-UI_BUTTON_BG = "#3a3a3a"
-UI_ACTIVE_BG = "#4a6078"
-
 DEFAULT_CONFIG = {
+    "email_provider": "duckmail",
+    "yyds_api_key": "",
+    "yyds_jwt": "",
+    "defaultDomains": "",
     "duckmail_api_key": "",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
@@ -64,7 +63,6 @@ DEFAULT_CONFIG = {
     "cpa_auth_dir": "cpa_auths",
     "cpa_proxy": "",
     "cpa_headless": False,
-    "cpa_probe_after_write": True,
     "cpa_mint_timeout_sec": 240,
     "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
     "cpa_force_standalone": False,
@@ -253,25 +251,55 @@ def start_speed_logger(get_counts, log_callback, stop_event, interval_sec=60):
     return thread, meter
 
 
+def read_config_file():
+    """读取脚本旁的配置文件；格式错误时不回退到默认配置。"""
+    if not os.path.exists(CONFIG_FILE):
+        return DEFAULT_CONFIG.copy()
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as stream:
+            loaded = json.load(stream)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"config.json 格式错误：第 {exc.lineno} 行，第 {exc.colno} 列。") from None
+    except OSError:
+        raise ValueError("无法读取 config.json，请检查文件权限。") from None
+    except UnicodeError:
+        raise ValueError("config.json 需要使用 UTF-8 编码。") from None
+    if not isinstance(loaded, dict):
+        raise ValueError("config.json 顶层必须是 JSON 对象。")
+    return {**DEFAULT_CONFIG, **loaded}
+
+
+def config_file_signature():
+    """返回配置文件版本标识，用于检测外部修改和原子替换。"""
+    try:
+        info = os.stat(CONFIG_FILE)
+        return info.st_mtime_ns, info.st_size, info.st_ino
+    except OSError:
+        return None
+
+
 def load_config():
     global config
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            config = {**DEFAULT_CONFIG, **loaded}
-        except Exception:
-            config = DEFAULT_CONFIG.copy()
+    config = read_config_file()
     return config
 
 
-def save_config():
+def save_config(values=None):
+    """原子保存配置；文件仅当前用户可读写，失败时保留原文件。"""
+    temporary_path = None
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
-        os.chmod(CONFIG_FILE, 0o600)
-    except Exception as e:
-        print(f"保存配置失败: {e}")
+        directory = os.path.dirname(os.path.abspath(CONFIG_FILE))
+        fd, temporary_path = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(config if values is None else values, stream, indent=4, ensure_ascii=False)
+        os.replace(temporary_path, CONFIG_FILE)
+        return True
+    except Exception as exc:
+        print(f"保存配置失败: {exc}")
+        return False
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 def ensure_stable_python_runtime():
@@ -1725,107 +1753,6 @@ def _set_worker_id(wid):
     _tls.worker_id = wid
 
 
-def setup_light_theme(root):
-    try:
-        root.option_add("*Background", UI_BG)
-        root.option_add("*Foreground", UI_FG)
-        root.option_add("*selectBackground", UI_ACTIVE_BG)
-        root.option_add("*selectForeground", UI_FG)
-        root.option_add("*insertBackground", UI_FG)
-        root.option_add("*Entry.Background", UI_ENTRY_BG)
-        root.option_add("*Text.Background", UI_ENTRY_BG)
-        root.option_add("*Menu.Background", UI_ENTRY_BG)
-        root.option_add("*Menu.Foreground", UI_FG)
-        style = ttk.Style(root)
-        available = set(style.theme_names())
-        if "clam" in available:
-            style.theme_use("clam")
-        elif "default" in available:
-            style.theme_use("default")
-        root.configure(bg=UI_BG)
-        style.configure(".", background=UI_BG, foreground=UI_FG, fieldbackground=UI_ENTRY_BG)
-        style.configure("TFrame", background=UI_BG)
-        style.configure("TLabelframe", background=UI_BG, foreground=UI_FG)
-        style.configure("TLabelframe.Label", background=UI_BG, foreground=UI_FG)
-        style.configure("TLabel", background=UI_BG, foreground=UI_FG)
-        style.configure("TCheckbutton", background=UI_BG, foreground=UI_FG)
-        style.configure("TButton", background=UI_BUTTON_BG, foreground=UI_FG)
-        style.configure("TEntry", fieldbackground=UI_ENTRY_BG, foreground=UI_FG)
-        style.configure("TCombobox", fieldbackground=UI_ENTRY_BG, foreground=UI_FG)
-        style.configure("TSpinbox", fieldbackground=UI_ENTRY_BG, foreground=UI_FG)
-    except Exception:
-        pass
-
-
-def tk_label(parent, text="", **kwargs):
-    return tk.Label(parent, text=text, bg=kwargs.pop("bg", UI_BG), fg=kwargs.pop("fg", UI_FG), **kwargs)
-
-
-def tk_entry(parent, textvariable=None, width=30, **kwargs):
-    return tk.Entry(
-        parent,
-        textvariable=textvariable,
-        width=width,
-        bg=UI_ENTRY_BG,
-        fg=UI_FG,
-        insertbackground=UI_FG,
-        disabledbackground="#2f2f2f",
-        disabledforeground=UI_MUTED_FG,
-        highlightthickness=1,
-        highlightbackground="#555555",
-        relief=tk.SOLID,
-        **kwargs,
-    )
-
-
-def tk_button(parent, text="", command=None, state=tk.NORMAL, **kwargs):
-    return tk.Button(
-        parent,
-        text=text,
-        command=command,
-        state=state,
-        bg=UI_BUTTON_BG,
-        fg=UI_FG,
-        activebackground=UI_ACTIVE_BG,
-        activeforeground=UI_FG,
-        disabledforeground="#777777",
-        relief=tk.RAISED,
-        padx=10,
-        pady=3,
-        **kwargs,
-    )
-
-
-def tk_checkbutton(parent, text="", variable=None, **kwargs):
-    return tk.Checkbutton(
-        parent,
-        text=text,
-        variable=variable,
-        bg=UI_BG,
-        fg=UI_FG,
-        activebackground=UI_BG,
-        activeforeground=UI_FG,
-        selectcolor="#3d7be0",
-        **kwargs,
-    )
-
-
-def tk_option_menu(parent, variable, values, width=12):
-    menu = tk.OptionMenu(parent, variable, *values)
-    menu.configure(
-        width=width,
-        bg=UI_ENTRY_BG,
-        fg=UI_FG,
-        activebackground=UI_ACTIVE_BG,
-        activeforeground=UI_FG,
-        highlightthickness=1,
-        highlightbackground="#555555",
-        relief=tk.SOLID,
-    )
-    menu["menu"].configure(bg=UI_ENTRY_BG, fg=UI_FG, activebackground=UI_ACTIVE_BG, activeforeground=UI_FG)
-    return menu
-
-
 def start_browser(log_callback=None):
     last_exc = None
     for attempt in range(1, 5):
@@ -3131,7 +3058,7 @@ class GrokRegisterGUI:
         self.root = root
         self.root.title("Grok 注册机")
         self.root.geometry("1120x900")
-        self.root.minsize(960, 700)
+        self.root.minsize(860, 650)
         self.is_running = False
         self.batch_count = 0
         self.success_count = 0
@@ -3139,213 +3066,200 @@ class GrokRegisterGUI:
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
+        self.ui_thread_id = threading.get_ident()
+        self.worker_threads = []
         self.accounts_output_file = ""
         self.setup_ui()
 
     def setup_ui(self):
-        load_config()
-        main_frame = tk.Frame(self.root, bg=UI_BG, padx=10, pady=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        main_frame.grid_columnconfigure(0, weight=1)
-        main_frame.grid_rowconfigure(3, weight=1)
+        self.settings_dirty = False
+        self.config_load_error = None
+        try:
+            values = load_config()
+        except ValueError as exc:
+            values = DEFAULT_CONFIG.copy()
+            self.config_load_error = str(exc)
+        self.config_signature = config_file_signature()
+        self.observed_signature = self.config_signature
+        setup_light_theme(self.root)
+        main_frame = ttk.Frame(self.root, padding=18, style="Shell.TFrame")
+        main_frame.pack(fill="both", expand=True)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(1, weight=1)
 
-        config_frame = tk.LabelFrame(
-            main_frame,
-            text="配置",
-            bg=UI_PANEL_BG,
-            fg=UI_FG,
-            padx=10,
-            pady=10,
-            relief=tk.GROOVE,
-            borderwidth=1,
-        )
-        config_frame.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
-        config_frame.grid_columnconfigure(1, weight=1, minsize=260)
-        config_frame.grid_columnconfigure(3, weight=1, minsize=260)
+        header = ttk.Frame(main_frame, style="Shell.TFrame")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Grok 注册机", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="任务配置与凭证导入", style="Source.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 7))
+        self.source_label = ttk.Label(header, text=f"配置文件  {CONFIG_FILE}", style="Source.TLabel")
+        self.source_label.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.source_label.bind("<Configure>", lambda event: self.source_label.configure(wraplength=event.width))
+        self.reload_btn = ttk.Button(header, text="重新读取配置", command=self.reload_settings)
+        self.reload_btn.grid(row=0, column=1, rowspan=2, sticky="e")
 
-        def add_label(row, column, text):
-            tk_label(config_frame, text=text, bg=UI_PANEL_BG).grid(
-                row=row,
-                column=column,
-                sticky=tk.W,
-                padx=(0, 6),
-                pady=3,
-            )
+        self.panes = tk.PanedWindow(main_frame, orient="vertical", background="#dce3ee",
+                                   borderwidth=0, sashwidth=8, sashpad=4, sashrelief="flat",
+                                   opaqueresize=True, showhandle=False)
+        self.panes.grid(row=1, column=0, sticky="nsew")
+        self.settings = SettingsPanel(self.panes, values, self._settings_changed)
+        self.panes.add(self.settings, minsize=180, stretch="always")
 
-        def add_field(widget, row, column, columnspan=1, sticky=tk.EW):
-            widget.grid(
-                row=row,
-                column=column,
-                columnspan=columnspan,
-                sticky=sticky,
-                padx=(0, 14),
-                pady=3,
-            )
-
-        add_label(0, 0, "邮箱服务商:")
-        self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
-        add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
-
-        add_label(0, 2, "注册数量:")
-        self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
-        self.count_spinbox = tk.Spinbox(
-            config_frame,
-            from_=1,
-            to=2500,
-            width=8,
-            textvariable=self.count_var,
-            bg=UI_ENTRY_BG,
-            fg=UI_FG,
-            insertbackground=UI_FG,
-            buttonbackground=UI_BUTTON_BG,
-            disabledbackground="#2f2f2f",
-            disabledforeground=UI_MUTED_FG,
-            relief=tk.SOLID,
-        )
-        add_field(self.count_spinbox, 0, 3, sticky=tk.W)
-
-        add_label(1, 0, "注册选项:")
-        self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
-        self.cf_auto_click_var = tk.BooleanVar(value=bool(config.get("cf_auto_click", True)))
-        self.keep_cf_cookies_var = tk.BooleanVar(value=bool(config.get("keep_cf_cookies", True)))
-        opt_box = tk.Frame(config_frame, bg=UI_PANEL_BG)
-        self.nsfw_check = tk_checkbutton(opt_box, text="注册后开启 NSFW", variable=self.nsfw_var)
-        self.nsfw_check.pack(side=tk.LEFT)
-        self.cf_auto_click_check = tk_checkbutton(opt_box, text="自动点击人机验证", variable=self.cf_auto_click_var)
-        self.cf_auto_click_check.pack(side=tk.LEFT, padx=(10, 0))
-        self.keep_cf_cookies_check = tk_checkbutton(opt_box, text="保留CF Cookie", variable=self.keep_cf_cookies_var)
-        self.keep_cf_cookies_check.pack(side=tk.LEFT, padx=(10, 0))
-        add_field(opt_box, 1, 1, sticky=tk.W)
-
-        add_label(1, 2, "代理（可选）:")
-        self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
-        self.proxy_entry = tk_entry(config_frame, textvariable=self.proxy_var, width=34)
-        add_field(self.proxy_entry, 1, 3)
-
-        add_label(2, 0, "DuckMail API Key:")
-        self.api_key_var = tk.StringVar(value=config.get("duckmail_api_key", ""))
-        self.api_key_entry = tk_entry(config_frame, textvariable=self.api_key_var, width=34)
-        add_field(self.api_key_entry, 2, 1)
-
-        add_label(2, 2, "Cloudflare 鉴权模式:")
-        self.cloudflare_auth_mode_var = tk.StringVar(value=config.get("cloudflare_auth_mode", "none"))
-        self.cloudflare_auth_mode_combo = tk_option_menu(
-            config_frame, self.cloudflare_auth_mode_var, ["query-key", "bearer", "x-api-key", "x-admin-auth", "none"], width=12
-        )
-        add_field(self.cloudflare_auth_mode_combo, 2, 3, sticky=tk.W)
-
-        add_label(3, 0, "Cloudflare API Base:")
-        self.cloudflare_api_base_var = tk.StringVar(value=config.get("cloudflare_api_base", ""))
-        self.cloudflare_api_base_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_base_var, width=72)
-        add_field(self.cloudflare_api_base_entry, 3, 1, columnspan=3)
-
-        add_label(4, 0, "Cloudflare API Key:")
-        self.cloudflare_api_key_var = tk.StringVar(value=config.get("cloudflare_api_key", ""))
-        self.cloudflare_api_key_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_key_var, width=34)
-        add_field(self.cloudflare_api_key_entry, 4, 1)
-
-        add_label(4, 2, "CF 路径:")
-        self.cloudflare_paths_var = tk.StringVar(
-            value=",".join(
-                [
-                    config.get("cloudflare_path_domains", "/api/domains"),
-                    config.get("cloudflare_path_accounts", "/api/new_address"),
-                    config.get("cloudflare_path_token", "/api/token"),
-                    config.get("cloudflare_path_messages", "/api/mails"),
-                ]
-            )
-        )
-        self.cloudflare_paths_entry = tk_entry(config_frame, textvariable=self.cloudflare_paths_var, width=34)
-        add_field(self.cloudflare_paths_entry, 4, 3)
-
-        add_label(5, 0, "grok2api 本地入池:")
-        self.grok2api_local_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_local", True)))
-        self.grok2api_local_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_local_auto_var)
-        add_field(self.grok2api_local_auto_check, 5, 1, sticky=tk.W)
-
-        add_label(5, 2, "grok2api 池名:")
-        self.grok2api_pool_name_var = tk.StringVar(value=str(config.get("grok2api_pool_name", "ssoBasic")))
-        self.grok2api_pool_name_combo = tk_option_menu(
-            config_frame, self.grok2api_pool_name_var, ["ssoBasic", "ssoSuper"], width=12
-        )
-        add_field(self.grok2api_pool_name_combo, 5, 3, sticky=tk.W)
-
-        add_label(6, 0, "本地 token.json:")
-        self.grok2api_local_file_var = tk.StringVar(value=str(config.get("grok2api_local_token_file", "")))
-        self.grok2api_local_file_entry = tk_entry(config_frame, textvariable=self.grok2api_local_file_var, width=72)
-        add_field(self.grok2api_local_file_entry, 6, 1, columnspan=3)
-
-        add_label(7, 0, "grok2api 远端入池:")
-        self.grok2api_remote_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_remote", False)))
-        self.grok2api_remote_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_remote_auto_var)
-        add_field(self.grok2api_remote_auto_check, 7, 1, sticky=tk.W)
-
-        add_label(8, 0, "grok2api 远端 Base:")
-        self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
-        self.grok2api_remote_base_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_base_var, width=72)
-        add_field(self.grok2api_remote_base_entry, 8, 1, columnspan=3)
-
-        add_label(9, 0, "grok2api 远端 app_key:")
-        self.grok2api_remote_key_var = tk.StringVar(value=str(config.get("grok2api_remote_app_key", "")))
-        self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
-        add_field(self.grok2api_remote_key_entry, 9, 1, columnspan=3)
-
-        btn_frame = tk.Frame(main_frame, bg=UI_BG)
-        btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
-        self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
-        self.start_btn.pack(side=tk.LEFT, padx=5)
-        self.stop_btn = tk_button(btn_frame, text="停止", command=self.stop_registration, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
-        self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
-        self.clear_btn.pack(side=tk.LEFT, padx=5)
-
-        status_frame = tk.Frame(main_frame, bg=UI_BG)
-        status_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 6))
-        self.status_var = tk.StringVar(value="就绪")
-        tk_label(status_frame, text="状态: ").pack(side=tk.LEFT)
-        self.status_label = tk.Label(status_frame, textvariable=self.status_var, bg=UI_BG, fg="green")
-        self.status_label.pack(side=tk.LEFT)
+        log_frame = ttk.Frame(self.panes, padding=12)
+        self.panes.add(log_frame, minsize=140, stretch="always")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(1, weight=1)
+        log_header = ttk.Frame(log_frame)
+        log_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(log_header, text="运行日志", style="Section.TLabel").pack(side="left")
+        ttk.Label(log_header, text="拖动上方分隔条调整高度", style="Hint.TLabel").pack(side="left", padx=14)
+        self.clear_btn = ttk.Button(log_header, text="清空", command=self.clear_log)
+        self.clear_btn.pack(side="right")
         self.stats_var = tk.StringVar(value="成功: 0 | 失败: 0")
-        tk.Label(status_frame, textvariable=self.stats_var, bg=UI_BG, fg=UI_FG).pack(side=tk.RIGHT)
-        log_frame = tk.LabelFrame(
-            main_frame,
-            text="日志",
-            bg=UI_PANEL_BG,
-            fg=UI_FG,
-            padx=5,
-            pady=5,
-            relief=tk.GROOVE,
-            borderwidth=1,
-        )
-        log_frame.grid(row=3, column=0, sticky=tk.NSEW)
-        log_frame.grid_columnconfigure(0, weight=1)
-        log_frame.grid_rowconfigure(0, weight=1)
+        ttk.Label(log_header, textvariable=self.stats_var, style="Hint.TLabel").pack(side="right", padx=14)
         self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            height=18,
-            width=60,
-            bg="#111111",
-            fg="#f5f5f5",
-            insertbackground="#f5f5f5",
-            selectbackground="#345a8a",
-            selectforeground="#ffffff",
-            relief=tk.SOLID,
-            borderwidth=1,
-            highlightthickness=1,
-            highlightbackground="#555555",
-        )
-        self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
-        self.log("[*] GUI 已就绪，配置已加载")
-        self.log(f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()}")
+            log_frame, height=10, width=60, font=("Menlo", 12), spacing1=2, spacing3=2,
+            background="#111d30", foreground="#e5edf9", insertbackground="#ffffff",
+            selectbackground="#365b91", selectforeground="#ffffff", relief="flat",
+            borderwidth=0, highlightthickness=0, padx=12, pady=10, wrap="word", state="disabled")
+        self.log_text.grid(row=1, column=0, sticky="nsew")
+
+        footer = ttk.Frame(main_frame, style="Shell.TFrame")
+        footer.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        actions = ttk.Frame(footer, style="Shell.TFrame")
+        actions.pack(fill="x")
+        self.start_btn = ttk.Button(actions, text="开始注册", command=self.start_registration, style="Primary.TButton")
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(actions, text="停止", command=self.stop_registration, state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
+        self.save_btn = ttk.Button(actions, text="保存配置", command=self.save_settings)
+        self.save_btn.pack(side="left", padx=(8, 0))
+        self.show_secrets_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(actions, text="显示密钥", variable=self.show_secrets_var,
+                        command=lambda: self.settings.show_secrets(self.show_secrets_var.get())).pack(side="right")
+        status_frame = ttk.Frame(footer, style="Shell.TFrame")
+        status_frame.pack(fill="x", pady=(10, 0))
+        self.status_var = tk.StringVar(value="就绪")
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, style="Shell.TLabel", foreground="#167044")
+        self.status_label.pack(side="left")
+        initial_status = "文件读取失败；请修复后重新读取" if self.config_load_error else "已与配置文件同步"
+        self.config_status_var = tk.StringVar(value=initial_status)
+        ttk.Label(status_frame, textvariable=self.config_status_var, style="Shell.TLabel",
+                  foreground=UI_MUTED_FG).pack(side="left", padx=18)
+        if self.config_load_error:
+            self.log("[!] " + self.config_load_error)
+        else:
+            self.log("[*] GUI 已就绪，已读取配置文件")
+            self.log(f"[*] 当前导入目标: {self.settings.target_var.get()}")
+        self.panes.bind("<Map>", self._initial_pane_position)
+        self.root.after(80, self._drain_ui_queue)
+        self.root.after(1500, self._watch_config_file)
+
+    def _initial_pane_position(self, event=None):
+        self.panes.unbind("<Map>")
+        self.root.after_idle(lambda: self.panes.sash_place(0, 0, int(self.panes.winfo_height() * 0.58)))
+
+    def reload_settings(self, confirm=True):
+        """重新读取文件；运行中的配置保持不变，未保存的草稿需要明确放弃。"""
+        if confirm and self.settings_dirty:
+            if not messagebox.askyesno("重新读取配置", "重新读取会放弃界面中未保存的修改，是否继续？", parent=self.root):
+                return False
+        try:
+            if self.config_signature is not None and config_file_signature() is None:
+                raise ValueError("config.json 已删除或无法访问，请恢复文件后重新读取。")
+            values = read_config_file()
+        except ValueError as exc:
+            self.config_load_error = str(exc)
+            self.config_status_var.set("文件读取失败；保留当前表单，暂停保存和启动")
+            if confirm:
+                messagebox.showerror("读取失败", str(exc), parent=self.root)
+            return False
+        self.settings.load_values(values)
+        self.settings.show_secrets(self.show_secrets_var.get())
+        self.settings_dirty = False
+        self.config_load_error = None
+        self.config_signature = config_file_signature()
+        self.observed_signature = self.config_signature
+        self.config_status_var.set("已读取文件；下批生效" if self.is_running else "已与配置文件同步")
+        return True
+
+    def _check_external_config(self):
+        signature = config_file_signature()
+        if signature == self.config_signature:
+            return not self.config_load_error
+        if self.settings_dirty:
+            self.config_status_var.set("文件已在外部修改；请重新读取后再保存或启动")
+            return False
+        return self.reload_settings(confirm=False)
+
+    def _watch_config_file(self):
+        """文件变化时刷新未编辑的表单；有草稿时提示冲突，不覆盖任一侧。"""
+        signature = config_file_signature()
+        if signature != self.observed_signature:
+            self.observed_signature = signature
+            self._check_external_config()
+        self.root.after(1500, self._watch_config_file)
+
+    def _can_use_settings(self):
+        if self._check_external_config():
+            return True
+        message = self.config_load_error or "config.json 已在外部修改。请点击“重新读取配置”，核对后再保存或开始。"
+        messagebox.showerror("配置需要同步", message, parent=self.root)
+        return False
+
+    def _mark_settings_saved(self, values):
+        self.settings.load_values(values)
+        self.settings_dirty = False
+        self.config_signature = config_file_signature()
+        self.observed_signature = self.config_signature
+
+    def _drain_ui_queue(self):
+        """在 Tk 主线程处理后台日志和运行状态。"""
+        for _ in range(200):
+            try:
+                callback, args = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            callback(*args)
+        self.root.after(80, self._drain_ui_queue)
+
+    def _settings_changed(self):
+        self.settings_dirty = True
+        if not hasattr(self, "config_status_var"):
+            return
+        text = "有未保存的修改"
+        if self.is_running:
+            text += "；下批生效"
+        self.config_status_var.set(text)
+
+    def save_settings(self):
+        """仅保存表单草稿，不改变运行中的批次配置。"""
+        if not self._can_use_settings():
+            return False
+        try:
+            values = self.settings.collect()
+        except ValueError as exc:
+            messagebox.showerror("配置有误", str(exc), parent=self.root)
+            return False
+        if not save_config(values):
+            messagebox.showerror("保存失败", "无法写入 config.json，请检查目录权限或可用磁盘空间。", parent=self.root)
+            return False
+        self._mark_settings_saved(values)
+        self.config_status_var.set("已保存；下批生效" if self.is_running else "已保存；开始注册时生效")
+        self.log("[*] 配置已保存" + ("，当前批次继续使用启动时的配置" if self.is_running else ""))
+        return True
 
     def log(self, message):
+        if threading.get_ident() != self.ui_thread_id:
+            self.ui_queue.put((self.log, (message,)))
+            return
         if not should_emit_log(message):
             return
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
         print(line, flush=True)
         try:
+            self.log_text.configure(state="normal")
             self.log_text.insert(tk.END, f"{line}\n")
             # 防止长时间运行日志区无限增长导致卡顿
             try:
@@ -3355,21 +3269,31 @@ class GrokRegisterGUI:
             except Exception:
                 pass
             self.log_text.see(tk.END)
+            self.log_text.configure(state="disabled")
         except Exception:
             pass
 
     def clear_log(self):
+        self.log_text.configure(state="normal")
         self.log_text.delete(1.0, tk.END)
+        self.log_text.configure(state="disabled")
 
     def update_stats(self):
+        if threading.get_ident() != self.ui_thread_id:
+            self.ui_queue.put((self.update_stats, ()))
+            return
         self.stats_var.set(f"成功: {self.success_count} | 失败: {self.fail_count}")
 
     def _set_running_ui(self, running):
+        if threading.get_ident() != self.ui_thread_id:
+            self.ui_queue.put((self._set_running_ui, (running,)))
+            return
         self.is_running = running
         self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
         self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
         self.status_var.set("运行中..." if running else "就绪")
-        self.status_label.config(foreground="blue" if running else "green")
+        self.status_label.config(foreground="#2458c6" if running else "#167044")
+        self.stop_btn.config(text="停止")
 
     def should_stop(self):
         return self.stop_requested or not self.is_running
@@ -3379,38 +3303,22 @@ class GrokRegisterGUI:
             self.log("[!] 当前已有任务在运行")
             return
 
-        config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
-        config["enable_nsfw"] = bool(self.nsfw_var.get())
-        config["cf_auto_click"] = bool(self.cf_auto_click_var.get())
-        config["keep_cf_cookies"] = bool(self.keep_cf_cookies_var.get())
-        config["proxy"] = self.proxy_var.get().strip()
-        config["duckmail_api_key"] = self.api_key_var.get().strip()
-        config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
-        config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
-        config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
-        config["grok2api_auto_add_local"] = bool(self.grok2api_local_auto_var.get())
-        config["grok2api_local_token_file"] = self.grok2api_local_file_var.get().strip()
-        config["grok2api_pool_name"] = self.grok2api_pool_name_var.get().strip() or "ssoBasic"
-        config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
-        config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
-        config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
-        raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
-        if len(raw_paths) >= 4:
-            config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
-            config["cloudflare_path_accounts"] = raw_paths[1] if raw_paths[1].startswith("/") else ("/" + raw_paths[1])
-            config["cloudflare_path_token"] = raw_paths[2] if raw_paths[2].startswith("/") else ("/" + raw_paths[2])
-            config["cloudflare_path_messages"] = raw_paths[3] if raw_paths[3].startswith("/") else ("/" + raw_paths[3])
-        save_config()
-        if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
-            self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
+        global config
+        if not self._can_use_settings():
             return
         try:
-            count = int(self.count_var.get())
-        except Exception:
-            self.log("[!] 注册数量无效")
+            values = self.settings.collect()
+        except ValueError as exc:
+            messagebox.showerror("配置有误", str(exc), parent=self.root)
             return
-        config["register_count"] = count
-        save_config()
+        if not save_config(values):
+            messagebox.showerror("保存失败", "无法保存配置，任务未启动。", parent=self.root)
+            return
+        self._mark_settings_saved(values)
+        config = values
+        count = values["register_count"]
+        self.worker_threads = []
+        self.config_status_var.set("当前批次配置已保存；新修改下批生效")
         self.stop_requested = False
         self.success_count = 0
         self.fail_count = 0
@@ -3430,7 +3338,11 @@ class GrokRegisterGUI:
         ).start()
 
     def stop_registration(self):
+        if not self.is_running:
+            return
         self.stop_requested = True
+        self.stop_btn.config(state="disabled", text="正在停止…")
+        self.status_var.set("停止中，等待浏览器及导入任务收尾")
         self.log("[!] 用户停止注册")
 
     def run_registration(self, count):
@@ -3461,11 +3373,14 @@ class GrokRegisterGUI:
                 speed_thread.join(timeout=2)
             except Exception:
                 pass
-            _wait_cpa_async_threads(
-                timeout=5 if self.should_stop() else 300,
-                log_callback=self.log,
-                skip_if_stopping=self.should_stop,
-            )
+            # 后台任务结束前不开放下一批，防止旧任务读取新批次的全局配置。
+            self.ui_queue.put((self.status_var.set, ("收尾中，等待浏览器及 CPA 导入完成",)))
+            for worker in self.worker_threads:
+                worker.join()
+            with _cpa_threads_lock:
+                pending_cpa = list(_cpa_async_threads)
+            for worker in pending_cpa:
+                worker.join()
             self._set_running_ui(False)
             self.log(
                 f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
@@ -3487,6 +3402,7 @@ class GrokRegisterGUI:
             )
             t.start()
             threads.append(t)
+            self.worker_threads.append(t)
             sleep_with_cancel(2, self.should_stop)
         _join_threads_interruptible(
             threads,
@@ -4124,7 +4040,6 @@ def main():
         main_cli()
         return
     root = tk.Tk()
-    setup_light_theme(root)
     app = GrokRegisterGUI(root)
     root.mainloop()
 
