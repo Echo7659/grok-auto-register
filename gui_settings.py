@@ -1,8 +1,11 @@
 """GUI 配置表单、主题和输入校验；不启动注册或执行网络请求。"""
 
+import os
 import tkinter as tk
 from tkinter import filedialog, ttk
 from urllib.parse import urlsplit
+
+import proxy_bridge
 
 
 UI_BG = "#f4f6fa"
@@ -122,6 +125,22 @@ def validate_config(values):
 
     platform = normalize_platform(values.get("platform", "grok"))
     values["platform"] = platform
+
+    proxy_mode = proxy_bridge.normalize_proxy_mode(values.get("proxy_mode"))
+    values["proxy_mode"] = proxy_mode
+    if proxy_mode == "pool":
+        pool_file = str(values.get("proxy_pool_file") or "").strip()
+        values["proxy_pool_file"] = pool_file
+        if not pool_file:
+            raise ValueError("代理池模式下请填写代理池文件路径。")
+        abs_pool = os.path.abspath(os.path.expanduser(pool_file))
+        if not os.path.isfile(abs_pool):
+            raise ValueError("代理池文件不存在，请检查路径。")
+        items = proxy_bridge.load_proxy_pool(abs_pool, force=True)
+        if not items:
+            raise ValueError("代理池文件中没有可用代理（支持 host:port:user:pass 或 http://user:pass@host:port）。")
+    else:
+        values["proxy"] = str(values.get("proxy") or "").strip()
 
     provider = str(values.get("email_provider") or "duckmail").strip().lower()
     values["email_provider"] = "onesecmail" if provider in ("1secmail", "one_sec_mail") else provider
@@ -322,6 +341,12 @@ class SettingsPanel(ttk.Frame):
             def browse():
                 if path == "directory":
                     selected = filedialog.askdirectory(parent=self, title=label)
+                elif path == "open":
+                    selected = filedialog.askopenfilename(
+                        parent=self,
+                        title=label,
+                        filetypes=(("Text", "*.txt"), ("All", "*.*")),
+                    )
                 else:
                     selected = filedialog.asksaveasfilename(parent=self, title=label, confirmoverwrite=False)
                 if selected:
@@ -334,7 +359,13 @@ class SettingsPanel(ttk.Frame):
 
     def _build_basic(self):
         body = self.tabs["基本设置"][0]
-        self._section(body, "任务参数", "修改后可单独保存。开始注册时，自动保存并使用当前表单中的设置。")
+        self._section(
+            body,
+            "任务参数",
+            "修改后可单独保存。开始注册时，自动保存并使用当前表单中的设置。"
+            "代理模式可选固定代理或代理池；格式支持 http://user:pass@host:port 与 host:port:user:pass。"
+            "代理池为每行一条，注册时随机选用；带账号的代理会自动走本地转发供浏览器使用。",
+        )
         platform = normalize_platform(self.base_values.get("platform", "grok"))
         self.platform_var = tk.StringVar(self, value=PLATFORM_LABELS.get(platform, "Grok"))
         row = self.rows[body]
@@ -352,7 +383,9 @@ class SettingsPanel(ttk.Frame):
         self.fields["platform"] = ([platform_box], "readonly")
         self._field(body, "register_count", "注册数量", minimum=1)
         self._field(body, "concurrent_count", "并发浏览器数", minimum=1)
-        self._field(body, "proxy", "注册代理（可留空）")
+        self._field(body, "proxy_mode", "代理模式", choices=("fixed", "pool"))
+        self._field(body, "proxy", "固定代理（可留空）")
+        self._field(body, "proxy_pool_file", "代理池文件", path="open")
         self._field(body, "enable_nsfw", "注册后开启 NSFW")
         self._section(body, "日志与输出")
         self._field(body, "log_level", "日志级别", choices=("quiet", "info", "debug"))
@@ -542,12 +575,19 @@ class SettingsPanel(ttk.Frame):
                 frame.grid()
             else:
                 frame.grid_remove()
+        proxy_mode = proxy_bridge.normalize_proxy_mode(
+            self.variables.get("proxy_mode").get() if "proxy_mode" in self.variables else "fixed"
+        )
         for key, (controls, normal_state) in self.fields.items():
             enabled = True
             if key == "enable_nsfw":
                 enabled = not is_local_auth
             elif key == "token_only_file":
                 enabled = not is_local_auth
+            elif key == "proxy":
+                enabled = proxy_mode == "fixed"
+            elif key == "proxy_pool_file":
+                enabled = proxy_mode == "pool"
             elif key.startswith("fish_"):
                 enabled = is_fish
             elif key.startswith("eleven_"):

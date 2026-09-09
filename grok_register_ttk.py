@@ -37,6 +37,7 @@ from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 
 import cf_turnstile
+import proxy_bridge
 import temp_mail_providers
 from platforms import elevenlabs, fishaudio
 
@@ -64,7 +65,9 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
+    "proxy_mode": "fixed",
     "proxy": "http://127.0.0.1:7890",
+    "proxy_pool_file": "",
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -362,8 +365,32 @@ EXTENSION_PATH = os.path.abspath(
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
 
+def get_active_proxy():
+    """Current thread proxy (pool pin or fixed config)."""
+    return proxy_bridge.active_proxy(config)
+
+
+def assign_proxy_for_attempt(log_callback=None):
+    """Pick proxy for the next browser session (re-roll in pool mode)."""
+    proxy = proxy_bridge.resolve_proxy_from_config(config, assign=True)
+    mode = proxy_bridge.normalize_proxy_mode(config.get("proxy_mode"))
+    if log_callback:
+        if proxy:
+            label = proxy_bridge.proxy_log_label(proxy)
+            if mode == "pool":
+                pool_size = len(proxy_bridge.load_proxy_pool(config.get("proxy_pool_file")))
+                log_callback(f"[*] 代理池随机选用 ({pool_size} 条): {label}")
+            else:
+                log_callback(f"[*] 使用固定代理: {label}")
+        elif mode == "pool":
+            log_callback("[!] 代理池为空或文件不可读，将直连")
+        else:
+            log_callback("[*] 未配置代理，将直连")
+    return proxy
+
+
 def get_proxies():
-    proxy = config.get("proxy", "")
+    proxy = proxy_bridge.proxy_for_http(get_active_proxy())
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
@@ -723,18 +750,23 @@ def upload_to_cpa_server(local_path, log_callback=None):
         return False
 
 
-def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, page=None):
+def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, page=None, proxy=None):
     if not config.get("cpa_export_enabled", True):
         if log_callback:
             log_callback("[cpa] CPA 导出已禁用，跳过")
         return {"ok": False, "skipped": True, "reason": "disabled"}
     try:
         from cpa_export import export_cpa_xai_for_account as _export
+        # Snapshot active proxy so async CPA threads keep the same exit IP.
+        cfg = dict(config)
+        active = proxy if proxy is not None else get_active_proxy()
+        if active:
+            cfg["proxy"] = active
         return _export(
             email, password,
             sso=sso,
             page=page,
-            config=config,
+            config=cfg,
             log_callback=log_callback,
         )
     except Exception as exc:
@@ -770,8 +802,9 @@ def create_browser_options():
         "--no-default-browser-check",
     ):
         options.set_argument(flag)
-    # 仅显式配置 proxy 时写入；TUN 模式保持空
-    proxy = str(config.get("proxy", "") or "").strip()
+    # 仅显式配置 proxy 时写入；TUN 模式保持空。
+    # Chromium 不支持 user:pass，认证代理会经本地 bridge 转发。
+    proxy = proxy_bridge.proxy_for_chromium(get_active_proxy())
     if proxy:
         try:
             options.set_proxy(proxy)
@@ -1853,7 +1886,11 @@ def _set_worker_id(wid):
 
 def start_browser(log_callback=None):
     last_exc = None
+    pool_mode = proxy_bridge.normalize_proxy_mode(config.get("proxy_mode")) == "pool"
     for attempt in range(1, 5):
+        # Fixed: assign once. Pool: re-roll on each start attempt so a dead proxy can be skipped.
+        if attempt == 1 or pool_mode:
+            assign_proxy_for_attempt(log_callback=log_callback)
         try:
             _set_browser(Chromium(create_browser_options()))
             tabs = _get_browser().get_tabs()
@@ -3674,6 +3711,7 @@ class GrokRegisterGUI:
         _cpa_page = _get_page()
         if config.get("cpa_export_enabled", True):
             cpa_async = bool(config.get("cpa_mint_async", True))
+            _cpa_proxy = get_active_proxy()
             if cpa_async:
                 log_fn("[*] 6. CPA xAI 导出 (异步)")
                 _cpa_bg_page = None
@@ -3683,6 +3721,7 @@ class GrokRegisterGUI:
                         r = export_cpa_xai_for_account(
                             email, profile.get("password", ""), sso=sso,
                             log_callback=log_fn, page=_cpa_bg_page,
+                            proxy=_cpa_proxy,
                         )
                         if r.get("ok"):
                             log_fn(f"[+] CPA xAI 导出成功: {r.get('path', '')}")
@@ -3698,6 +3737,7 @@ class GrokRegisterGUI:
                 cpa_result = export_cpa_xai_for_account(
                     email, profile.get("password", ""), sso=sso,
                     log_callback=log_fn, page=_cpa_page,
+                    proxy=_cpa_proxy,
                 )
                 if cpa_result.get("ok"):
                     log_fn(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
@@ -4167,6 +4207,7 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
     _cpa_page = _get_page()
     if config.get("cpa_export_enabled", True):
         cpa_async = bool(config.get("cpa_mint_async", True))
+        _cpa_proxy = get_active_proxy()
         if cpa_async:
             log_fn("[*] 6. CPA xAI 导出 (异步)")
             _cpa_bg_page = None
@@ -4176,6 +4217,7 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
                     r = export_cpa_xai_for_account(
                         email, profile.get("password", ""), sso=sso,
                         log_callback=log_fn, page=_cpa_bg_page,
+                        proxy=_cpa_proxy,
                     )
                     if r.get("ok"):
                         log_fn(f"[+] CPA xAI 导出成功: {r.get('path', '')}")
@@ -4191,6 +4233,7 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
             cpa_result = export_cpa_xai_for_account(
                 email, profile.get("password", ""), sso=sso,
                 log_callback=log_fn, page=_cpa_page,
+                proxy=_cpa_proxy,
             )
             if cpa_result.get("ok"):
                 log_fn(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
