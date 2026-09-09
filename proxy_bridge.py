@@ -14,10 +14,14 @@ from __future__ import annotations
 import base64
 import os
 import random
+import re
+import secrets
 import select
 import socket
 import threading
 from urllib.parse import quote, unquote, urlparse
+
+_SESSION_IN_USER_RE = re.compile(r"-session-[A-Za-z0-9_-]+", re.IGNORECASE)
 
 _lock = threading.Lock()
 _bridges: dict[str, "_AuthProxyBridge"] = {}
@@ -168,12 +172,42 @@ def load_proxy_pool(path: str | None, *, force: bool = False) -> list[str]:
     return items
 
 
-def pick_pool_proxy(path: str | None) -> str:
+def pick_pool_proxy(path: str | None, *, exclude: str | None = None) -> str:
     items = load_proxy_pool(path)
     if not items:
         return ""
-    return random.choice(items)
+    excluded = normalize_proxy(exclude) if exclude else ""
+    candidates = [item for item in items if item != excluded] if excluded else list(items)
+    if not candidates:
+        candidates = list(items)
+    return random.choice(candidates)
 
+
+def rotate_residential_session(raw: str | None) -> str:
+    """Force a new residential exit by rewriting ``-session-<id>`` in the username.
+
+    Works with Decodo / Smartproxy-style usernames such as
+    ``user-xxx-country-us-city-los_angeles``. Proxies without a username are
+    returned unchanged.
+    """
+    proxy = normalize_proxy(raw)
+    if not proxy:
+        return ""
+    parsed = urlparse(proxy)
+    user = unquote(parsed.username or "")
+    if not user:
+        return proxy
+    password = unquote(parsed.password or "")
+    session_id = secrets.token_hex(4)
+    if _SESSION_IN_USER_RE.search(user):
+        new_user = _SESSION_IN_USER_RE.sub(f"-session-{session_id}", user, count=1)
+    else:
+        new_user = f"{user}-session-{session_id}"
+    scheme = (parsed.scheme or "http").lower()
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if scheme == "https" else 80)
+    auth = f"{quote(new_user, safe='')}:{quote(password, safe='')}@"
+    return f"{scheme}://{auth}{host}:{port}"
 
 def set_thread_proxy(proxy: str | None) -> None:
     """Pin proxy for the current registration worker thread."""
@@ -183,6 +217,8 @@ def set_thread_proxy(proxy: str | None) -> None:
 def clear_thread_proxy() -> None:
     if hasattr(_thread, "proxy"):
         delattr(_thread, "proxy")
+    if hasattr(_thread, "force_rotate"):
+        delattr(_thread, "force_rotate")
 
 
 def get_thread_proxy() -> str | None:
@@ -192,25 +228,54 @@ def get_thread_proxy() -> str | None:
     return None
 
 
+def mark_force_rotate(enabled: bool = True) -> None:
+    """Ask the next ``assign=True`` resolve to pick a fresh exit IP."""
+    _thread.force_rotate = bool(enabled)
+
+
+def consume_force_rotate() -> bool:
+    flagged = bool(getattr(_thread, "force_rotate", False))
+    if hasattr(_thread, "force_rotate"):
+        delattr(_thread, "force_rotate")
+    return flagged
+
+
 def resolve_proxy_from_config(cfg: dict | None, *, assign: bool = False) -> str:
     """Resolve proxy for fixed/pool mode.
 
     When ``assign`` is True in pool mode, pick a random proxy and pin it to
     the current thread. When False, reuse the thread pin if present.
+
+    If ``mark_force_rotate()`` was set, pool mode prefers a different line and
+    fixed residential proxies rewrite ``-session-<id>`` for a new exit IP.
     """
     cfg = cfg or {}
     mode = normalize_proxy_mode(cfg.get("proxy_mode"))
+    force_rotate = consume_force_rotate() if assign else False
     if mode == "pool":
         pinned = get_thread_proxy()
         if assign or pinned is None:
-            chosen = pick_pool_proxy(cfg.get("proxy_pool_file"))
+            exclude = pinned if force_rotate else None
+            chosen = pick_pool_proxy(cfg.get("proxy_pool_file"), exclude=exclude)
+            if force_rotate and chosen and chosen == pinned:
+                # Single-line pool: still rotate residential session if possible.
+                chosen = rotate_residential_session(chosen) or chosen
             set_thread_proxy(chosen)
             return chosen
         return pinned
     fixed = normalize_proxy(cfg.get("proxy"))
+    pinned = get_thread_proxy()
     if assign:
+        if force_rotate and fixed:
+            fixed = rotate_residential_session(fixed) or fixed
+            set_thread_proxy(fixed)
+            return fixed
+        # Keep a previously rotated session on this thread across browser restarts.
+        if pinned:
+            return pinned
         set_thread_proxy(fixed)
-    return fixed
+        return fixed
+    return pinned if pinned is not None else fixed
 
 
 def active_proxy(cfg: dict | None = None) -> str:

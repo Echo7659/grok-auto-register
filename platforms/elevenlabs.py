@@ -5,11 +5,13 @@ Auth model (from frontend reverse):
    with email + account_metadata + recaptcha_token (hCaptcha) + optional Stripe Radar.
 2. Firebase Auth createUserWithEmailAndPassword (project xi-labs).
    Blocking Function validates the pre-registered hCaptcha and usually requires email verify.
-3. App API calls use Authorization: Bearer <Firebase ID token>
-   or xi-api-key from POST /v1/user/create-api-key.
+3. After sign-in, complete onboarding via
+   POST /v1/user/onboarding-survey-complete (web Bearer token).
+4. App/API usage keeps the **web** Firebase ID token:
+   Authorization: Bearer <Firebase ID token>
+   plus web generation headers (x-generation-surface / x-generation-actor).
 
-This module mirrors platforms/fishaudio.py: browser form helpers + local JSON auth export.
-hCaptcha solving and full email-verify loop still need integration in the register orchestrator.
+This module intentionally does **not** mint developer console xi-api-key / sk_ keys.
 """
 
 from __future__ import annotations
@@ -51,6 +53,10 @@ class ElevenRegistrationError(Exception):
 
 class ElevenCancelled(ElevenRegistrationError):
     """Raised when the user requests stop during ElevenLabs signup."""
+
+
+class ElevenHCaptchaBlocked(ElevenRegistrationError):
+    """Visible hCaptcha challenge — abandon this attempt and rotate proxy."""
 
 
 def _raise_if_cancelled(cancel_callback: CancelFn):
@@ -117,6 +123,8 @@ def build_auth_payload(
     workspace_id: str = "",
     auth_account_id: str = "",
     session_ttl_sec: int = DEFAULT_SESSION_TTL_SEC,
+    is_onboarding_completed: bool | None = None,
+    first_name: str = "",
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Build local auth JSON for ElevenLabs **web** session.
@@ -125,6 +133,9 @@ def build_auth_payload(
       Authorization: Bearer <access_token>
 
     This is intentionally not the developer console xi-api-key / sk_ key.
+    Web TTS also commonly sends:
+      x-generation-surface: Speech Synthesis
+      x-generation-actor: User
     """
     email = (email or "").strip()
     if not email:
@@ -145,7 +156,7 @@ def build_auth_payload(
     ttl = max(60, int(session_ttl_sec or DEFAULT_SESSION_TTL_SEC))
     expired_at = current + timedelta(seconds=ttl)
 
-    return {
+    payload: dict[str, Any] = {
         "type": "elevenlabs",
         "access_token": id_token,
         "refresh_token": refresh_token or id_token,
@@ -162,7 +173,20 @@ def build_auth_payload(
         "firebase_api_key": FIREBASE_API_KEY,
         "expired": expired_at.isoformat().replace("+00:00", "Z"),
         "last_refresh": current.isoformat().replace("+00:00", "Z"),
+        "request_headers": {
+            "Authorization": "Bearer <access_token>",
+            "Content-Type": "application/json",
+            "Origin": "https://elevenlabs.io",
+            "Referer": "https://elevenlabs.io/app/speech-synthesis",
+            "x-generation-surface": "Speech Synthesis",
+            "x-generation-actor": "User",
+        },
     }
+    if is_onboarding_completed is not None:
+        payload["is_onboarding_completed"] = bool(is_onboarding_completed)
+    if first_name:
+        payload["first_name"] = str(first_name).strip()
+    return payload
 
 def write_auth_file(auth_dir: str, payload: dict[str, Any]) -> str:
     auth_dir = os.path.abspath(str(auth_dir or "").strip() or DEFAULT_AUTH_DIR)
@@ -199,6 +223,57 @@ def _page_url(page) -> str:
             return str(page.run_js("return location.href") or "")
         except Exception:
             return ""
+
+
+def detect_hcaptcha_challenge(page) -> dict[str, Any]:
+    """Detect visible hCaptcha challenge (checkbox escalate / image select modal)."""
+    try:
+        state = page.run_js(
+            """
+return (() => {
+  function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+      return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 8 && rect.height > 8;
+  }
+  const frames = Array.from(document.querySelectorAll('iframe'));
+  const challengeFrames = frames.filter((f) => {
+    const src = String(f.src || '');
+    return /hcaptcha\\.com\\/(captcha|challenge)|newassets\\.hcaptcha\\.com/i.test(src) && isVisible(f);
+  });
+  const bigChallenge = challengeFrames.find((f) => {
+    const rect = f.getBoundingClientRect();
+    return rect.width >= 200 && rect.height >= 150;
+  });
+  const text = ((document.body && document.body.innerText) || '').replace(/\\s+/g, ' ');
+  const prompt = /select each image|请选择包含|contain(s)? (a |an )?(airplane|bus|boat|bridge|bicycle|car|traffic light)/i.test(text);
+  const checkbox = frames.some((f) => /hcaptcha\\.com\\/check|hcaptcha-checkbox/i.test(String(f.src || '')) && isVisible(f));
+  const visible = !!(bigChallenge || prompt);
+  return {
+    visible,
+    checkbox,
+    challenge_frames: challengeFrames.length,
+    prompt,
+    title: bigChallenge ? String(bigChallenge.title || '') : '',
+  };
+})()
+"""
+        )
+        if isinstance(state, dict):
+            return state
+    except Exception:
+        pass
+    return {
+        "visible": False,
+        "checkbox": False,
+        "challenge_frames": 0,
+        "prompt": False,
+        "title": "",
+    }
 
 
 def detect_step(page) -> str:
@@ -305,10 +380,13 @@ def submit_signup_form(
     """Fill email/password, accept terms, click Sign up.
 
     Downstream network flow (handled by page JS):
-    - invisible hCaptcha → token
+    - invisible hCaptcha → token (may escalate to visible image challenge)
     - optional Stripe Radar session
     - POST /v1/user/pre-sign-up
     - Firebase accounts:signUp
+
+    Visible image challenges abort immediately via ``ElevenHCaptchaBlocked`` so
+    the orchestrator can rotate proxy and retry with a fresh account.
     """
     email = (email or "").strip()
     password = str(password or "")
@@ -326,6 +404,15 @@ def submit_signup_form(
             _emit(log_callback, f"[*] 注册表单已通过，当前步骤: {step}")
             return step
 
+        challenge = detect_hcaptcha_challenge(page)
+        if challenge.get("visible"):
+            _emit(log_callback, "[!] 检测到可见 hCaptcha 选图，中止本轮并更换代理重试")
+            raise ElevenHCaptchaBlocked("可见 hCaptcha 选图，更换代理重试")
+
+        if submitted:
+            # Avoid re-clicking Sign up while invisible hCaptcha / Firebase is in flight.
+            _sleep(1.2, cancel_callback)
+            continue
         result = page.run_js(
             """
 const email = String(arguments[0] || '').trim();
@@ -408,7 +495,6 @@ return (() => {
             "已提交注册表单，但未进入验证邮箱/应用页（常见阻塞：invisible hCaptcha 或 Firebase Blocking Function）"
         )
     raise ElevenRegistrationError("提交注册表单超时")
-
 
 def harvest_session(page, timeout: float = 60, log_callback: LogFn = None, cancel_callback: CancelFn = None) -> dict[str, str]:
     """Harvest Firebase ID token + xi_website_user cookie fields from the page."""
@@ -577,6 +663,15 @@ return (() => {
             _emit(log_callback, f"[*] 登录成功，当前步骤: {step}")
             return step
 
+        challenge = detect_hcaptcha_challenge(page)
+        if challenge.get("visible"):
+            _emit(log_callback, "[!] 登录出现可见 hCaptcha 选图，中止本轮并更换代理重试")
+            raise ElevenHCaptchaBlocked("登录可见 hCaptcha 选图，更换代理重试")
+
+        if submitted:
+            _sleep(1.5, cancel_callback)
+            continue
+
         result = page.run_js(
             """
 const email = String(arguments[0] || '').trim();
@@ -662,3 +757,191 @@ def extract_eleven_otp(text: str, subject: str = "") -> str | None:
         if match:
             return match.group(1)
     return None
+
+
+def _web_api_headers(id_token: str, *, referer: str = "https://elevenlabs.io/app/home") -> dict[str, str]:
+    token = (id_token or "").strip()
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Origin": "https://elevenlabs.io",
+        "Referer": referer,
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+        ),
+        "x-generation-surface": "Speech Synthesis",
+        "x-generation-actor": "User",
+    }
+
+
+def refresh_id_token(
+    refresh_token: str,
+    *,
+    firebase_api_key: str = FIREBASE_API_KEY,
+    proxies: dict | None = None,
+) -> dict[str, str]:
+    """Refresh Firebase ID token using the web API key + referer constraints."""
+    refresh_token = (refresh_token or "").strip()
+    if not refresh_token:
+        raise ElevenRegistrationError("refresh_token 为空，无法刷新")
+    from curl_cffi import requests as curl_requests
+
+    resp = curl_requests.post(
+        f"https://securetoken.googleapis.com/v1/token?key={firebase_api_key}",
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        headers={"Origin": "https://elevenlabs.io", "Referer": "https://elevenlabs.io/"},
+        timeout=30,
+        impersonate="chrome120",
+        proxies=proxies or {},
+    )
+    if resp.status_code != 200:
+        raise ElevenRegistrationError(f"刷新 Firebase token 失败: HTTP {resp.status_code} {resp.text[:200]}")
+    data = resp.json() if hasattr(resp, "json") else {}
+    id_token = str((data or {}).get("id_token") or "").strip()
+    new_refresh = str((data or {}).get("refresh_token") or refresh_token).strip()
+    if not id_token:
+        raise ElevenRegistrationError("刷新 Firebase token 成功但未返回 id_token")
+    return {"id_token": id_token, "refresh_token": new_refresh}
+
+
+def fetch_user_info(id_token: str, *, proxies: dict | None = None) -> dict[str, Any]:
+    from curl_cffi import requests as curl_requests
+
+    resp = curl_requests.get(
+        f"{API_BASE}/v1/user",
+        headers=_web_api_headers(id_token),
+        timeout=30,
+        impersonate="chrome120",
+        proxies=proxies or {},
+    )
+    if resp.status_code != 200:
+        raise ElevenRegistrationError(f"获取用户信息失败: HTTP {resp.status_code} {resp.text[:200]}")
+    data = resp.json() if hasattr(resp, "json") else {}
+    if not isinstance(data, dict):
+        raise ElevenRegistrationError("获取用户信息失败: 响应不是 JSON 对象")
+    return data
+
+
+def complete_onboarding(
+    id_token: str,
+    *,
+    first_name: str = "Alex",
+    role: str = "personal_use",
+    platform: str = "creative_ui",
+    source: str = "other",
+    usecases: list[str] | None = None,
+    timezone_name: str = "America/Los_Angeles",
+    theme: str = "light",
+    proxies: dict | None = None,
+    log_callback: LogFn = None,
+) -> dict[str, Any]:
+    """Finish /app/onboarding via the same web Bearer token (no xi-api-key).
+
+    Calls POST /v1/user/onboarding-survey-complete used by the frontend.
+    """
+    from curl_cffi import requests as curl_requests
+
+    id_token = (id_token or "").strip()
+    if not id_token:
+        raise ElevenRegistrationError("id_token 为空，无法完成 onboarding")
+
+    try:
+        user = fetch_user_info(id_token, proxies=proxies)
+        if user.get("is_onboarding_completed"):
+            _emit(log_callback, "[*] ElevenLabs onboarding 已完成，跳过")
+            return {"ok": True, "skipped": True, "user": user}
+    except ElevenRegistrationError as exc:
+        _emit(log_callback, f"[Debug] 预检查 onboarding 状态失败，继续提交: {exc}")
+
+    name = (first_name or "Alex").strip() or "Alex"
+    name = name[:1].upper() + name[1:].lower()
+    body = {
+        "platform": platform or "creative_ui",
+        "first_name": name,
+        "role": role or "personal_use",
+        "timezone": timezone_name or "America/Los_Angeles",
+        "source": source or "other",
+        "usecases": list(usecases or ["text-to-speech"]),
+        "theme": theme or "light",
+        "birthday_unix": 0,
+    }
+    _emit(log_callback, f"[*] 提交 ElevenLabs onboarding: role={body['role']} usecases={body['usecases']}")
+    resp = curl_requests.post(
+        f"{API_BASE}/v1/user/onboarding-survey-complete",
+        headers=_web_api_headers(id_token, referer="https://elevenlabs.io/app/onboarding"),
+        json=body,
+        timeout=30,
+        impersonate="chrome120",
+        proxies=proxies or {},
+    )
+    if resp.status_code != 200:
+        raise ElevenRegistrationError(
+            f"完成 onboarding 失败: HTTP {resp.status_code} {resp.text[:300]}"
+        )
+
+    user = fetch_user_info(id_token, proxies=proxies)
+    if not user.get("is_onboarding_completed"):
+        raise ElevenRegistrationError("onboarding 接口返回成功，但 is_onboarding_completed 仍为 false")
+    _emit(log_callback, "[+] ElevenLabs onboarding 已完成")
+    return {"ok": True, "skipped": False, "user": user, "body": body}
+
+
+def probe_web_tts(
+    id_token: str,
+    *,
+    voice_id: str = "21m00Tcm4TlvDq8ikWAM",
+    text: str = "hello",
+    proxies: dict | None = None,
+) -> dict[str, Any]:
+    """Probe web-credential TTS. Useful to surface free-tier unusual_activity early."""
+    from curl_cffi import requests as curl_requests
+
+    headers = _web_api_headers(id_token, referer="https://elevenlabs.io/app/speech-synthesis")
+    headers["Accept"] = "audio/mpeg"
+    resp = curl_requests.post(
+        f"{API_BASE}/v1/text-to-speech/{voice_id}",
+        headers=headers,
+        json={"text": text, "model_id": "eleven_multilingual_v2"},
+        timeout=30,
+        impersonate="chrome120",
+        proxies=proxies or {},
+    )
+    detail = ""
+    status = ""
+    if resp.status_code >= 400:
+        try:
+            payload = resp.json()
+            detail_obj = (payload or {}).get("detail") or {}
+            if isinstance(detail_obj, dict):
+                status = str(detail_obj.get("status") or "")
+                detail = str(detail_obj.get("message") or detail_obj)[:300]
+            else:
+                detail = str(detail_obj)[:300]
+        except Exception:
+            detail = (resp.text or "")[:300]
+    return {
+        "ok": resp.status_code == 200,
+        "status_code": resp.status_code,
+        "status": status,
+        "detail": detail,
+        "bytes": len(resp.content or b"") if resp.status_code == 200 else 0,
+    }
+
+
+def leave_onboarding_page(page, log_callback: LogFn = None, cancel_callback: CancelFn = None):
+    """Best-effort navigate away from /app/onboarding after survey completion."""
+    _raise_if_cancelled(cancel_callback)
+    url = _page_url(page).lower()
+    if "/app/onboarding" not in url and detect_step(page) != "onboarding":
+        return False
+    target = "https://elevenlabs.io/app/home"
+    _emit(log_callback, f"[*] 离开 onboarding 页 -> {target}")
+    try:
+        page.get(target)
+        _sleep(1.2, cancel_callback)
+    except Exception as exc:
+        _emit(log_callback, f"[Debug] 跳转 home 失败: {exc}")
+        return False
+    return True

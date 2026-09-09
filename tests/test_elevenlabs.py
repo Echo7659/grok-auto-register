@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from gui_settings import is_local_auth_platform, normalize_platform, validate_config
 from platforms import elevenlabs
@@ -20,6 +21,8 @@ class ElevenAuthPayloadTests(unittest.TestCase):
             workspace_id="workspace_abc",
             auth_account_id="firebaseUid",
             session_ttl_sec=3600,
+            is_onboarding_completed=True,
+            first_name="Alex",
             now=now,
         )
         self.assertEqual(payload["type"], "elevenlabs")
@@ -29,6 +32,9 @@ class ElevenAuthPayloadTests(unittest.TestCase):
         self.assertEqual(payload["refresh_token"], "refresh-1")
         self.assertEqual(payload["project_id"], "workspace_abc")
         self.assertEqual(payload["api_base"], elevenlabs.API_BASE)
+        self.assertTrue(payload["is_onboarding_completed"])
+        self.assertEqual(payload["first_name"], "Alex")
+        self.assertEqual(payload["request_headers"]["x-generation-surface"], "Speech Synthesis")
         self.assertNotIn("xi_api_key", payload)
         self.assertTrue(payload["expired"].endswith("Z"))
 
@@ -51,6 +57,93 @@ class ElevenAuthPayloadTests(unittest.TestCase):
             loaded = json.loads(Path(path).read_text(encoding="utf-8"))
             self.assertEqual(loaded["access_token"], "token-1")
             self.assertEqual(loaded["auth_kind"], "web_firebase_id_token")
+
+
+class ElevenOnboardingHelpersTests(unittest.TestCase):
+    def test_detect_hcaptcha_challenge_reads_visible_flag(self):
+        class FakePage:
+            def run_js(self, script):
+                return {
+                    "visible": True,
+                    "checkbox": False,
+                    "challenge_frames": 1,
+                    "prompt": True,
+                    "title": "含有飞机的图片",
+                }
+
+        state = elevenlabs.detect_hcaptcha_challenge(FakePage())
+        self.assertTrue(state["visible"])
+        self.assertTrue(state["prompt"])
+
+    def test_submit_signup_raises_when_visible_hcaptcha(self):
+        class FakePage:
+            def __init__(self):
+                self.calls = 0
+
+            def run_js(self, script, *args):
+                text = str(script or "")
+                if "hcaptcha" in text.lower() or "challengeFrames" in text or "challenge_frames" in text:
+                    return {"visible": True, "prompt": True, "challenge_frames": 1, "checkbox": False, "title": "x"}
+                if "detect_step" in text or "verification link" in text or "sign-up" in text:
+                    return "signup"
+                # First form fill reports submitted; next loop hits captcha.
+                self.calls += 1
+                if "sign\\s*up" in text or "Sign up" in text or "submitted" in text or "terms" in text:
+                    return {"state": "submitted"}
+                return {"state": "submitted"}
+
+        # Force detect_step via URL-less page: patch helpers.
+        with mock.patch.object(elevenlabs, "detect_step", return_value="signup"), mock.patch.object(
+            elevenlabs, "detect_hcaptcha_challenge", side_effect=[{"visible": False}, {"visible": True}]
+        ):
+            page = FakePage()
+            with self.assertRaises(elevenlabs.ElevenHCaptchaBlocked):
+                elevenlabs.submit_signup_form(page, "a@b.com", "Nabcd1234!a7#zzzz", timeout=5)
+
+    def test_web_api_headers_use_bearer_not_xi_api_key(self):
+        headers = elevenlabs._web_api_headers("tok-1")
+        self.assertEqual(headers["Authorization"], "Bearer tok-1")
+        self.assertNotIn("xi-api-key", {k.lower() for k in headers})
+        self.assertEqual(headers["x-generation-actor"], "User")
+
+    def test_complete_onboarding_posts_survey_body(self):
+        calls = []
+
+        class FakeResp:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+                self.text = json.dumps(payload)
+                self.content = self.text.encode()
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, **kwargs):
+            calls.append(("GET", url, kwargs.get("json")))
+            if len([c for c in calls if c[0] == "GET"]) == 1:
+                return FakeResp(200, {"is_onboarding_completed": False})
+            return FakeResp(200, {"is_onboarding_completed": True, "first_name": "Alex", "user_id": "u1"})
+
+        def fake_post(url, **kwargs):
+            calls.append(("POST", url, kwargs.get("json")))
+            return FakeResp(200, {"status": "ok"})
+
+        with mock.patch("curl_cffi.requests.get", side_effect=fake_get), mock.patch(
+            "curl_cffi.requests.post", side_effect=fake_post
+        ):
+            result = elevenlabs.complete_onboarding("id-token", first_name="alex")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["skipped"])
+        post_calls = [c for c in calls if c[0] == "POST"]
+        self.assertEqual(len(post_calls), 1)
+        self.assertIn("/v1/user/onboarding-survey-complete", post_calls[0][1])
+        body = post_calls[0][2]
+        self.assertEqual(body["first_name"], "Alex")
+        self.assertEqual(body["platform"], "creative_ui")
+        self.assertEqual(body["role"], "personal_use")
+        self.assertEqual(body["usecases"], ["text-to-speech"])
 
 
 class ElevenMailExtractionTests(unittest.TestCase):

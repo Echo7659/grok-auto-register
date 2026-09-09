@@ -131,7 +131,9 @@ python grok_register_ttk.py cli
 | `register_count` | 目标注册数量 |
 | `concurrent_count` | 并发 worker 数 |
 | `email_provider` | `duckmail` / `mailtm` / `onesecmail` / `yyds` / `cloudflare` |
-| `proxy` | 代理，可留空 |
+| `proxy_mode` | `fixed` 固定代理 / `pool` 代理池随机出口 |
+| `proxy` | 固定代理（`proxy_mode=fixed` 时使用），可留空 |
+| `proxy_pool_file` | 代理池文件（`proxy_mode=pool`），每行一条 |
 | `fish_auth_dir` | Fish Audio 授权目录，默认 `fish_auths` |
 | `eleven_auth_dir` | ElevenLabs 授权目录，默认 `eleven_auths` |
 | `eleven_session_ttl_sec` | ElevenLabs ID Token 记录的有效期（秒），默认 `3600` |
@@ -139,7 +141,8 @@ python grok_register_ttk.py cli
 | `cf_auto_click` | Cloudflare Turnstile 自动点击（默认开启） |
 | `keep_cf_cookies` | 账号间重启时保留 CF cookie（默认开启） |
 
-更多邮箱、CPA、grok2api 细节见下方章节与 `config.example.json`。
+更多邮箱、CPA、grok2api 细节见下方章节与 `config.example.json`。  
+手动从浏览器提取 ElevenLabs 网页凭证：见 [`docs/elevenlabs-manual-auth.md`](docs/elevenlabs-manual-auth.md)。
 
 ## 邮箱服务
 
@@ -203,13 +206,34 @@ Cloudflare 匿名模式示例：
 }
 ```
 
-调用方式：
+调用方式（网页凭证，不是 `xi-api-key`）：
 
 ```bash
 curl -s https://api.us.elevenlabs.io/v1/user \
   -H "Authorization: Bearer <access_token>" \
-  -H "x-generation-surface: XI_APP"
+  -H "Origin: https://elevenlabs.io" \
+  -H "Referer: https://elevenlabs.io/app/home" \
+  -H "x-generation-surface: Speech Synthesis" \
+  -H "x-generation-actor: User"
 ```
+
+探测脚本：`scripts/verify_eleven_web_auth.py`。
+
+## 下一步计划（待完成）
+
+以下为当前已知、尚未闭环的工作，方便跟进：
+
+1. **代理池落地验证**  
+   将常用配置切到 `proxy_mode=pool`，把 Decodo 等住宅代理写成多 session / 多出口池（`proxies.txt`），再跑一轮注册 + TTS 对比，确认可见 hCaptcha 跳过换 IP、以及 `detected_unusual_activity` 是否随出口改善。
+
+2. **Free Tier `401 detected_unusual_activity` 继续压测**  
+   官方文案指向代理/VPN、多免费号。需验证：独立干净出口、降低同 IP 密度、注册与调用是否同出口。浏览器 UA/指纹不是主因，但调用侧 TLS（`curl_cffi` vs 真 Chrome）可做对照实验。
+
+3. **可选：打码平台接入**  
+   若不想依赖“可见选图就换代理”，可接入 CapSolver / 2Captcha 等自动解 hCaptcha（需用户自备 Key）。
+
+4. **文档与示例同步**  
+   保持 `docs/elevenlabs-manual-auth.md` 与导出 JSON 字段、网页调用头一致；按实测结果更新 FAQ。
 
 ## 稳定性机制
 
@@ -225,8 +249,14 @@ curl -s https://api.us.elevenlabs.io/v1/user \
 **CLI 为什么还会开浏览器？**  
 CLI 只是不启动 Tk；注册页与验证码仍依赖真实浏览器。
 
+**ElevenLabs 出现可见 hCaptcha 选图？**  
+程序会**中止本轮账号**，自动更换代理出口后重试（代理池换一条；固定住宅代理会旋转 `-session-` 出口）。建议 `proxy_mode=pool` 并准备多条代理。
+
+**ElevenLabs 网页凭证调 TTS 返回 401 `detected_unusual_activity`？**  
+多为免费档风控（代理/VPN、批量免费号），与是否完成 onboarding、是否创建官方 API Key 无关。可换更干净出口后重试；手动提凭证方法见 [`docs/elevenlabs-manual-auth.md`](docs/elevenlabs-manual-auth.md)。
+
 **ElevenLabs 卡在 Sign up Loading？**  
-通常是 invisible hCaptcha。可降低并发、更换出口 IP / 代理，或稍后重试。
+通常是 invisible hCaptcha 未放行。可降低并发、更换出口 IP / 代理，或稍后重试。
 
 **ElevenLabs 收不到验证邮件？**  
 公开临时域可能被拒；优先 Cloudflare 自有域名，或换 Mail.tm / DuckMail 再试。
@@ -243,10 +273,15 @@ CLI 只是不启动 Tk；注册页与验证码仍依赖真实浏览器。
 .
 ├── grok_register_ttk.py     # 主程序（GUI / CLI）
 ├── gui_settings.py          # GUI 配置表单
+├── proxy_bridge.py          # 固定代理 / 代理池 / session 旋转
 ├── temp_mail_providers.py   # Mail.tm / 1secMail
 ├── platforms/
 │   ├── fishaudio.py         # Fish Audio
 │   └── elevenlabs.py        # ElevenLabs（网页 Firebase 授权）
+├── docs/
+│   └── elevenlabs-manual-auth.md  # 手动提取网页凭证
+├── scripts/
+│   └── verify_eleven_web_auth.py  # 网页凭证探测
 ├── cf_turnstile.py          # Turnstile / CF cookie
 ├── turnstilePatch/          # 浏览器扩展补丁
 ├── cpa_export.py / cpa_xai/ # CPA 导出

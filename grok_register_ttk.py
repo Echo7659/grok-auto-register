@@ -372,16 +372,20 @@ def get_active_proxy():
 
 def assign_proxy_for_attempt(log_callback=None):
     """Pick proxy for the next browser session (re-roll in pool mode)."""
+    prev = proxy_bridge.get_thread_proxy()
     proxy = proxy_bridge.resolve_proxy_from_config(config, assign=True)
     mode = proxy_bridge.normalize_proxy_mode(config.get("proxy_mode"))
     if log_callback:
         if proxy:
             label = proxy_bridge.proxy_log_label(proxy)
+            rotated = bool(prev) and proxy != prev
             if mode == "pool":
                 pool_size = len(proxy_bridge.load_proxy_pool(config.get("proxy_pool_file")))
-                log_callback(f"[*] 代理池随机选用 ({pool_size} 条): {label}")
+                suffix = "（已避开上一出口）" if rotated else ""
+                log_callback(f"[*] 代理池随机选用 ({pool_size} 条): {label}{suffix}")
             else:
-                log_callback(f"[*] 使用固定代理: {label}")
+                suffix = "（已旋转 session 出口）" if rotated else ""
+                log_callback(f"[*] 使用固定代理: {label}{suffix}")
         elif mode == "pool":
             log_callback("[!] 代理池为空或文件不可读，将直连")
         else:
@@ -4037,6 +4041,11 @@ def _register_one_account_eleven(log_fn, cancel_callback, accounts_output_file):
         return _register_one_account_eleven_body(log_fn, cancel_callback, accounts_output_file)
     except elevenlabs.ElevenCancelled as exc:
         raise RegistrationCancelled(str(exc) or "用户停止注册") from exc
+    except elevenlabs.ElevenHCaptchaBlocked as exc:
+        # Burn current exit IP and let the worker restart browser + retry the slot.
+        proxy_bridge.mark_force_rotate(True)
+        log_fn(f"[!] {exc}（将更换代理出口后重试）")
+        raise AccountRetryNeeded(str(exc) or "可见 hCaptcha，更换代理重试") from exc
 
 
 def _register_one_account_eleven_body(log_fn, cancel_callback, accounts_output_file):
@@ -4109,15 +4118,66 @@ def _register_one_account_eleven_body(log_fn, cancel_callback, accounts_output_f
     )
     session = elevenlabs.harvest_session(page, log_callback=log_fn, cancel_callback=cancel_callback)
 
+    log_fn("[*] 5. 完成 ElevenLabs onboarding（网页凭证，不创建官方 API Key）")
+    proxies = get_proxies()
+    first_name = random.choice(
+        ["Alex", "Sam", "Jordan", "Taylor", "Casey", "Riley", "Morgan", "Quinn"]
+    )
+    onboard = elevenlabs.complete_onboarding(
+        session.get("id_token", ""),
+        first_name=first_name,
+        proxies=proxies,
+        log_callback=log_fn,
+    )
+    try:
+        elevenlabs.leave_onboarding_page(page, log_callback=log_fn, cancel_callback=cancel_callback)
+    except Exception as leave_exc:
+        log_fn(f"[Debug] 离开 onboarding 页时出错: {leave_exc}")
+
+    # Fresh token after onboarding keeps exported credentials closer to browser state.
+    id_token = session.get("id_token", "")
+    refresh_token = session.get("refresh_token", "")
+    if refresh_token:
+        try:
+            refreshed = elevenlabs.refresh_id_token(refresh_token, proxies=proxies)
+            id_token = refreshed.get("id_token") or id_token
+            refresh_token = refreshed.get("refresh_token") or refresh_token
+            session["id_token"] = id_token
+            session["refresh_token"] = refresh_token
+            log_fn("[*] 已刷新网页 Firebase ID token")
+        except Exception as refresh_exc:
+            log_fn(f"[Debug] 刷新 ID token 失败，沿用登录态: {refresh_exc}")
+
+    user_info = onboard.get("user") if isinstance(onboard, dict) else {}
+    if not isinstance(user_info, dict):
+        user_info = {}
+    try:
+        probe = elevenlabs.probe_web_tts(id_token, proxies=proxies)
+        if probe.get("ok"):
+            log_fn(f"[+] 网页凭证 TTS 探测成功 ({probe.get('bytes', 0)} bytes)")
+        else:
+            status = probe.get("status") or f"HTTP {probe.get('status_code')}"
+            detail = probe.get("detail") or ""
+            log_fn(f"[!] 网页凭证 TTS 探测失败: {status} {detail}")
+            if status == "detected_unusual_activity":
+                log_fn(
+                    "[!] Free Tier 被风控禁用（代理/VPN 或多免费号常见）。"
+                    "网页端也可能随后不可用；这与是否完成 onboarding 无关。"
+                )
+    except Exception as probe_exc:
+        log_fn(f"[Debug] TTS 探测异常: {probe_exc}")
+
     ttl = int(config.get("eleven_session_ttl_sec", 3600) or 3600)
     payload = elevenlabs.build_auth_payload(
-        email=email or session.get("email", ""),
-        id_token=session.get("id_token", ""),
-        refresh_token=session.get("refresh_token", ""),
-        user_id=session.get("user_id", ""),
+        email=email or session.get("email", "") or user_info.get("email", ""),
+        id_token=id_token,
+        refresh_token=refresh_token,
+        user_id=session.get("user_id", "") or str(user_info.get("user_id") or ""),
         workspace_id=session.get("workspace_id", ""),
         auth_account_id=session.get("auth_account_id", ""),
         session_ttl_sec=ttl,
+        is_onboarding_completed=bool(user_info.get("is_onboarding_completed", True)),
+        first_name=str(user_info.get("first_name") or first_name),
     )
     auth_dir = str(config.get("eleven_auth_dir", "eleven_auths") or "eleven_auths").strip()
     if not os.path.isabs(auth_dir):
@@ -4143,8 +4203,8 @@ def _register_one_account_eleven_body(log_fn, cancel_callback, accounts_output_f
         "token": payload["access_token"],
         "auth_path": auth_path,
         "payload": payload,
+        "onboarding": onboard,
     }
-
 
 def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
     platform = get_platform()

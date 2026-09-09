@@ -90,6 +90,27 @@ class ProxyPoolTests(unittest.TestCase):
             self.assertIn("pool.example.com", got)
             self.assertEqual(proxy_bridge.get_thread_proxy(), got)
 
+    def test_rotate_residential_session_appends_session(self):
+        raw = "dc.decodo.com:10001:user-sp31umh5d4-country-us-city-los_angeles:secret"
+        rotated = proxy_bridge.rotate_residential_session(raw)
+        user = urlparse(rotated).username or ""
+        self.assertIn("-session-", user)
+        self.assertTrue(user.startswith("user-sp31umh5d4-country-us-city-los_angeles-session-"))
+
+    def test_force_rotate_fixed_rewrites_session_and_keeps_pin(self):
+        cfg = {
+            "proxy_mode": "fixed",
+            "proxy": "dc.decodo.com:10001:user-sp31umh5d4-country-us:secret",
+        }
+        first = proxy_bridge.resolve_proxy_from_config(cfg, assign=True)
+        proxy_bridge.mark_force_rotate(True)
+        second = proxy_bridge.resolve_proxy_from_config(cfg, assign=True)
+        self.assertNotEqual(first, second)
+        self.assertIn("-session-", urlparse(second).username or "")
+        # Later assign without force_rotate should keep the rotated pin.
+        third = proxy_bridge.resolve_proxy_from_config(cfg, assign=True)
+        self.assertEqual(second, third)
+
 
 if __name__ == "__main__":
     unittest.main()
